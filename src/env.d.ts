@@ -31,10 +31,14 @@ interface Window {
     runPlugin: (name: string, input: string) => Promise<string>
     reloadPlugins: () => Promise<{ name: string; description: string; triggers: string[] }[]>
     transcribeAudio: (audioData: ArrayBuffer, groqKey: string) => Promise<{ success: boolean; transcript?: string; error?: string }>
+    ttsSpeak: (text: string, apiKey: string, voiceId: string) => Promise<{ success: boolean; audio?: string; error?: string }>
     gitStatus:   (cwd: string) => Promise<string>
     gitLog:      (cwd: string, n?: number) => Promise<string>
     gitDiff:     (cwd: string, staged?: boolean) => Promise<string>
     gitBranches: (cwd: string) => Promise<string>
     gitCommit:   (cwd: string, message: string) => Promise<string>
+    memoryGet:   () => Promise<Array<{ id: string; text: string; createdAt: number }>>
+    memoryAdd:   (text: string) => Promise<{ success: boolean }>
+    memoryClear: () => Promise<{ success: boolean }>
   }
 }

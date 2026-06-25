@@ -35,9 +35,14 @@ contextBridge.exposeInMainWorld('ai', {
   reloadPlugins: (): Promise<{ name: string; description: string; triggers: string[] }[]> => ipcRenderer.invoke('ai:reloadPlugins'),
   transcribeAudio: (audioData: ArrayBuffer, groqKey: string): Promise<{ success: boolean; transcript?: string; error?: string }> =>
     ipcRenderer.invoke('ai:transcribeAudio', Buffer.from(audioData), groqKey),
+  ttsSpeak: (text: string, apiKey: string, voiceId: string): Promise<{ success: boolean; audio?: string; error?: string }> =>
+    ipcRenderer.invoke('ai:ttsSpeak', text, apiKey, voiceId),
   gitStatus:   (cwd: string): Promise<string> => ipcRenderer.invoke('ai:gitStatus', cwd),
   gitLog:      (cwd: string, n?: number): Promise<string> => ipcRenderer.invoke('ai:gitLog', cwd, n),
   gitDiff:     (cwd: string, staged?: boolean): Promise<string> => ipcRenderer.invoke('ai:gitDiff', cwd, staged),
   gitBranches: (cwd: string): Promise<string> => ipcRenderer.invoke('ai:gitBranches', cwd),
   gitCommit:   (cwd: string, message: string): Promise<string> => ipcRenderer.invoke('ai:gitCommit', cwd, message),
+  memoryGet:   (): Promise<Array<{ id: string; text: string; createdAt: number }>> => ipcRenderer.invoke('ai:memoryGet'),
+  memoryAdd:   (text: string): Promise<{ success: boolean }> => ipcRenderer.invoke('ai:memoryAdd', text),
+  memoryClear: (): Promise<{ success: boolean }> => ipcRenderer.invoke('ai:memoryClear'),
 })

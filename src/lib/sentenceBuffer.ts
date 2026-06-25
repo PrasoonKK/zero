@@ -1,30 +1,47 @@
-// Splits a streaming text into complete sentences as chunks arrive.
-// Feed chunks via push(), get back any complete sentences ready to speak.
-// Call flush() at end of stream for any remaining partial sentence.
+// WordBuffer — fires every N words so TTS starts within the first few tokens,
+// not at the end of a full sentence.
+//
+// ElevenLabs: batch=12 (fewer API calls, still fast — first audio in ~600ms)
+// OS voices:  batch=5  (instant local TTS, near character-by-character feel)
 
-export class SentenceBuffer {
-  private buf = ''
+export class WordBuffer {
+  private words: string[] = []
+  private partial = ''         // current incomplete word (no trailing space yet)
+  readonly batchSize: number
 
+  constructor(batchSize = 5) {
+    this.batchSize = batchSize
+  }
+
+  /** Feed a raw streaming chunk. Returns any ready batches to speak. */
   push(chunk: string): string[] {
-    this.buf += chunk
-    const out: string[] = []
-    // Match sentences ending with . ! ? followed by whitespace or end
-    // Also split on newlines (code blocks, lists)
-    const re = /[^.!?\n]+[.!?]+[\s]*/g
-    let m: RegExpExecArray | null
-    let last = 0
-    while ((m = re.exec(this.buf)) !== null) {
-      const s = m[0].trim()
-      if (s.length > 4) out.push(s)   // skip noise like "ok." or "I."
-      last = m.index + m[0].length
+    // Build word list from buffer + chunk
+    const raw = this.partial + chunk
+    const parts = raw.split(/(\s+)/)  // split keeping whitespace
+
+    // Last part may be an incomplete word (no space yet)
+    const endsWithSpace = /\s$/.test(raw)
+    this.partial = endsWithSpace ? '' : (parts.pop() ?? '')
+
+    // Add completed words
+    for (const p of parts) {
+      const w = p.trim()
+      if (w) this.words.push(w)
     }
-    this.buf = this.buf.slice(last)
+
+    const out: string[] = []
+    while (this.words.length >= this.batchSize) {
+      out.push(this.words.splice(0, this.batchSize).join(' '))
+    }
     return out
   }
 
+  /** Call at end of stream — returns any remaining words. */
   flush(): string {
-    const r = this.buf.trim()
-    this.buf = ''
-    return r
+    const all = [...this.words]
+    if (this.partial.trim()) all.push(this.partial.trim())
+    this.words = []
+    this.partial = ''
+    return all.join(' ')
   }
 }

@@ -1,8 +1,9 @@
-import { IpcMain, app } from 'electron'
+import { IpcMain, app, clipboard, desktopCapturer, Notification } from 'electron'
 import { execSync } from 'child_process'
-import { readFileSync } from 'fs'
+import { readFileSync, writeFileSync } from 'fs'
 import { join, resolve } from 'path'
 import { gitStatus, gitLog, gitDiff, gitBranches } from './git'
+import { addMemory, getMemories, clearMemories } from './memory'
 
 interface CommandPattern {
   regex: string
@@ -10,6 +11,7 @@ interface CommandPattern {
   capture?: number
   captureDir?: number
   captureAlt?: string   // fallback value when capture group didn't match
+  captureTask?: number
 }
 
 function loadPatterns(): CommandPattern[] {
@@ -268,6 +270,92 @@ export async function detectSystemCommand(input: string): Promise<string | null>
         case 'open_app': {
           const idx = pattern.capture ?? 1
           return openApp(match[idx] || '')
+        }
+        case 'screenshot': {
+          try {
+            const sources = await desktopCapturer.getSources({
+              types: ['screen'],
+              thumbnailSize: { width: 1920, height: 1080 },
+            })
+            if (!sources.length) return '⚠ No screen source found.'
+            const img = sources[0].thumbnail
+            const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+            const desktop = join(process.env.USERPROFILE || process.env.HOME || '', 'Desktop')
+            const outPath = join(desktop, `screenshot-${ts}.png`)
+            writeFileSync(outPath, img.toPNG())
+            return `📸 Screenshot saved: ${outPath}`
+          } catch (e) {
+            return `⚠ Screenshot failed: ${String(e)}`
+          }
+        }
+        case 'clipboard_read': {
+          const text = clipboard.readText()
+          if (!text.trim()) return '📋 Clipboard is empty.'
+          const preview = text.length > 800 ? text.slice(0, 800) + '\n...(truncated)' : text
+          return `📋 Clipboard:\n\`\`\`\n${preview}\n\`\`\``
+        }
+        case 'clipboard_copy_last':
+          return '__COPY_LAST__'
+        case 'reminder': {
+          const timeStr = (match[pattern.capture ?? 1] || '').trim().toLowerCase()
+          const task    = (match[pattern.captureTask ?? 2] || timeStr).trim()
+
+          let ms = 0
+          const m = timeStr.match(/(\d+)\s*min/)
+          const h = timeStr.match(/(\d+)\s*h(?:our)?/)
+          const s = timeStr.match(/(\d+)\s*sec/)
+          if (m) ms += parseInt(m[1]) * 60000
+          if (h) ms += parseInt(h[1]) * 3600000
+          if (s) ms += parseInt(s[1]) * 1000
+
+          if (!ms || ms < 1000) return '⚠ Could not parse time. Try: "remind me in 5 minutes to check email"'
+
+          const label = task.replace(/^\d+\s*(?:min(?:utes?)?|h(?:ours?)?|seconds?)\s*/i, '').trim() || 'Reminder'
+          setTimeout(() => {
+            new Notification({ title: '⏰ Zero Reminder', body: label }).show()
+          }, ms)
+
+          const display = ms >= 3600000
+            ? `${Math.round(ms/3600000)} hour(s)`
+            : ms >= 60000
+              ? `${Math.round(ms/60000)} minute(s)`
+              : `${Math.round(ms/1000)} second(s)`
+          return `⏰ Reminder set for ${display}: "${label}"`
+        }
+        case 'sysinfo': {
+          try {
+            const cpu = execSync(
+              `powershell -c "(Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average"`,
+              { timeout: 6000, encoding: 'utf-8' }
+            ).trim()
+            const ram = execSync(
+              `powershell -c "$o=Get-WmiObject Win32_OperatingSystem; [math]::Round(($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/1MB,1).ToString()+'/'+ [math]::Round($o.TotalVisibleMemorySize/1MB,1).ToString()+' GB'"`,
+              { timeout: 6000, encoding: 'utf-8' }
+            ).trim()
+            const disk = execSync(
+              `powershell -c "Get-PSDrive C|%{[math]::Round($_.Used/1GB,1).ToString()+'/'+[math]::Round(($_.Used+$_.Free)/1GB,1).ToString()+' GB'}"`,
+              { timeout: 6000, encoding: 'utf-8' }
+            ).trim()
+            return `💻 System Health\n• CPU: ${cpu}% load\n• RAM: ${ram} used\n• Disk C: ${disk} used`
+          } catch {
+            return '⚠ Could not read system stats. Check PowerShell permissions.'
+          }
+        }
+        case 'remember': {
+          const text = (match[pattern.capture ?? 1] || '').trim()
+          if (!text) return '⚠ Nothing to remember.'
+          addMemory(text)
+          return `✅ Got it — I'll remember: "${text}"`
+        }
+        case 'show_memories': {
+          const entries = getMemories()
+          if (!entries.length) return '📭 No memories yet. Say "remember that..." to save something.'
+          const list = entries.slice(-10).reverse().map((e, i) => `${i+1}. ${e.text}`).join('\n')
+          return `🧠 I remember (last ${Math.min(10, entries.length)}):\n\n${list}`
+        }
+        case 'clear_memories': {
+          clearMemories()
+          return '🗑 All memories cleared.'
         }
         case 'quit':
           setTimeout(() => app.exit(0), 500)

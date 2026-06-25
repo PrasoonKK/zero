@@ -46,13 +46,13 @@ export default function InputBar(): React.JSX.Element {
   const isTTSOn    = settings.ttsEnabled
 
   // ─── Build message history ────────────────────────────────────────────────
-  const buildMessages = useCallback((userText: string): ChatMessage[] => {
+  const buildMessages = useCallback((userText: string, extraContext = ''): ChatMessage[] => {
     const history: ChatMessage[] = messages
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .filter(m => m.content.trim())
       .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
     return [
-      { role: 'system', content: SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.assistant },
+      { role: 'system', content: (SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.assistant) + extraContext },
       ...history,
       { role: 'user', content: userText },
     ]
@@ -68,11 +68,30 @@ export default function InputBar(): React.JSX.Element {
     addMessage({ role: 'user', content: text })
     ttsStop()
 
+    // Load memories for context injection
+    let memoryContext = ''
+    try {
+      const memories: Array<{id: string; text: string; createdAt: number}> = await window.ai.memoryGet()
+      if (memories.length > 0) {
+        memoryContext = '\n\nThings the user has asked you to remember:\n' +
+          memories.slice(-20).map(m => `• ${m.text}`).join('\n')
+      }
+    } catch { /* ignore */ }
+
     // ── System commands — call once ──
     let sysResult: string | null = null
     try {
       sysResult = await window.ai.systemCommand(text)
       if (sysResult !== null && !sysResult.startsWith(LLM_CTX)) {
+        if (sysResult === '__COPY_LAST__') {
+          const lastMsg = [...messages].reverse().find(m => m.role === 'assistant' && m.content.trim())
+          if (lastMsg) {
+            try { await navigator.clipboard.writeText(lastMsg.content) } catch {}
+            addMessage({ role: 'assistant', content: '✅ Copied last response to clipboard.' })
+          }
+          sendingRef.current = false
+          return
+        }
         addMessage({ role: 'assistant', content: sysResult })
         if (isTTSOn) void speak(sysResult)
         sendingRef.current = false
@@ -112,7 +131,7 @@ export default function InputBar(): React.JSX.Element {
     const model    = mode === 'coder' ? (settings.coderModel || 'codellama') : (settings.chatModel || 'mistral')
     const msgs     = llmInput !== text
       ? [{ role: 'system' as const, content: 'You are Zero, a helpful AI assistant. Be concise.' }, { role: 'user' as const, content: llmInput }]
-      : buildMessages(text)
+      : buildMessages(text, memoryContext)
     const abort    = new AbortController()
     abortRef.current = abort
     let accumulated = ''
