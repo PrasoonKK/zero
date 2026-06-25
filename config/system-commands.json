@@ -1,0 +1,17 @@
+{
+  "patterns": [
+    {"regex": "\\btime\\b", "action": "time"},
+    {"regex": "\\bdate\\b|\\btoday\\b", "action": "date"},
+    {"regex": "weather|temperature|forecast", "action": "weather"},
+    {"regex": "(?:find|search(?:\\s+for)?|locate)\\s+(?:file[s]?\\s+(?:named?|called)\\s+)?(.+?)(?:\\s+in\\s+(.+))?$", "action": "find_files", "capture": 1, "captureDir": 2},
+    {"regex": "brightness\\s+(up|down|\\d+)", "action": "brightness", "capture": 1},
+    {"regex": "volume\\s+(up|down|\\d+)", "action": "volume", "capture": 1},
+    {"regex": "^git\\s+status(?:\\s+(?:in|at|for)\\s+(.+))?$", "action": "git_status"},
+    {"regex": "^git\\s+log(?:\\s+(?:in|at|for)\\s+(.+))?$", "action": "git_log"},
+    {"regex": "^git\\s+diff(?:\\s+(?:in|at|for)\\s+(.+))?$", "action": "git_diff"},
+    {"regex": "^git\\s+branches?(?:\\s+(?:in|at|for)\\s+(.+))?$", "action": "git_branches"},
+    {"regex": "(?:generate|suggest|write|create)\\s+commit\\s+message(?:\\s+(?:in|at|for)\\s+(.+))?", "action": "git_commit_msg"},
+    {"regex": "open\\s+(.+)", "action": "open_app", "capture": 1},
+    {"regex": "^(quit|exit|close)$", "action": "quit"}
+  ]
+}

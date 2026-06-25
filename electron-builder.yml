@@ -1,0 +1,42 @@
+appId: com.zero.ai.assistant
+productName: Zero
+copyright: Copyright © 2024 Zero AI Contributors
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - out/**/*
+  - node_modules/**/*
+  - package.json
+
+extraResources:
+  - from: config/
+    to: config/
+    filter: ["**/*"]
+  - from: plugins/
+    to: plugins/
+    filter: ["**/*"]
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Zero AI
+
+publish:
+  provider: github
+  owner: zero-ai
+  repo: zero

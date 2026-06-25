@@ -1,0 +1,12 @@
+{
+  "chatModel": "mistral",
+  "coderModel": "codellama",
+  "hotkey": "Ctrl+Shift+A",
+  "theme": "dark",
+  "ollamaUrl": "http://localhost:11434",
+  "weatherCacheTTL": 1800000,
+  "responseCacheTTL": 86400000,
+  "maxCachedResponses": 1000,
+  "openrouterModel": "mistralai/mistral-7b-instruct:free",
+  "openrouterUrl": "https://openrouter.ai/api/v1"
+}
