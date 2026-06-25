@@ -58,18 +58,15 @@ export default function InputBar(): React.JSX.Element {
     addMessage({ role: 'user', content: text })
     ttsStop()  // stop any ongoing speech before responding
 
-    // ── System commands ──
-    const LLM_BYPASS_CTX = LLM_CTX
+    // ── System commands — call ONCE, reuse result in LLM block ──
+    let cachedSysResult: string | null = null
     try {
-      const sysResult = await window.ai.systemCommand(text)
-      if (sysResult !== null) {
-        if (!sysResult.startsWith(LLM_BYPASS_CTX)) {
-          addMessage({ role: 'assistant', content: sysResult })
-          if (isTTSOn) await speak(sysResult)
-          sendingRef.current = false
-          return
-        }
-        // Falls through with injected LLM context below
+      cachedSysResult = await window.ai.systemCommand(text)
+      if (cachedSysResult !== null && !cachedSysResult.startsWith(LLM_CTX)) {
+        addMessage({ role: 'assistant', content: cachedSysResult })
+        if (isTTSOn) await speak(cachedSysResult)
+        sendingRef.current = false
+        return
       }
     } catch { /* fall through */ }
 
@@ -98,14 +95,11 @@ export default function InputBar(): React.JSX.Element {
     setLoading(true)
     addMessage({ role: 'assistant', content: '', isStreaming: true })
 
-    // If system command returned __LLM_CONTEXT__, use that as the prompt
+    // If system command returned __LLM_CONTEXT__, use that as the prompt (use cached result)
     let llmInput = text
-    try {
-      const sysResult2 = await window.ai.systemCommand(text)
-      if (sysResult2?.startsWith(LLM_BYPASS_CTX)) {
-        llmInput = sysResult2.slice(LLM_BYPASS_CTX.length)
-      }
-    } catch { /* use original text */ }
+    if (cachedSysResult?.startsWith(LLM_CTX)) {
+      llmInput = cachedSysResult.slice(LLM_CTX.length)
+    }
 
     const model        = mode === 'coder' ? (settings.coderModel || 'codellama') : (settings.chatModel || 'mistral')
     const chatMessages = llmInput !== text
@@ -220,8 +214,8 @@ export default function InputBar(): React.JSX.Element {
         minSpeechMs: 1200,
         onVolume: v => setVadVolume(v),
         onSpeechStart: () => {
-          if (isSpeaking()) { ttsStop() }   // stop speaking so we don't record TTS audio
-          if (sendingRef.current) return
+          ttsStop()   // always stop TTS first — don't record our own voice
+          if (sendingRef.current) return   // bot still processing last message — skip
           setRecording(true)
           setInterimText('LISTENING...')
           vadChunks.current = []

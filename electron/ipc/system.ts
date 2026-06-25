@@ -9,6 +9,7 @@ interface CommandPattern {
   action: string
   capture?: number
   captureDir?: number
+  captureAlt?: string   // fallback value when capture group didn't match
 }
 
 function loadPatterns(): CommandPattern[] {
@@ -256,11 +257,13 @@ export async function detectSystemCommand(input: string): Promise<string | null>
         }
         case 'brightness': {
           const idx = pattern.capture ?? 1
-          return setBrightness(match[idx] || '')
+          const val = (match[idx] || pattern.captureAlt || '').replace('%', '')
+          return setBrightness(val)
         }
         case 'volume': {
           const idx = pattern.capture ?? 1
-          return setVolume(match[idx] || '')
+          const val = (match[idx] || pattern.captureAlt || '').replace('%', '')
+          return setVolume(val)
         }
         case 'open_app': {
           const idx = pattern.capture ?? 1
