@@ -12,7 +12,8 @@ export interface VADOptions {
 }
 
 export interface VADInstance {
-  stop: () => void
+  stop:   () => void
+  stream: MediaStream   // share with MediaRecorder — avoids a second getUserMedia
 }
 
 // Noise transcriptions Groq whispers on silence — discard these.
@@ -37,9 +38,9 @@ export function isNoiseTranscript(text: string): boolean {
 export async function startVAD(opts: VADOptions): Promise<VADInstance> {
   const {
     onSpeechStart, onSpeechEnd, onVolume,
-    threshold   = 35,
+    threshold   = 28,    // 28 out of 255 avg — loud enough for real speech, above quiet-room hiss
     silenceMs   = 1800,
-    minSpeechMs = 1500,
+    minSpeechMs = 1200,
   } = opts
 
   const stream  = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
@@ -103,6 +104,7 @@ export async function startVAD(opts: VADOptions): Promise<VADInstance> {
   rafId = requestAnimationFrame(tick)
 
   return {
+    stream,
     stop() {
       cancelAnimationFrame(rafId)
       stream.getTracks().forEach(t => t.stop())

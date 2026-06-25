@@ -32,12 +32,43 @@ async function transcribeWithGroq(audioBuffer: Buffer, apiKey: string): Promise<
   }
 }
 
+// ElevenLabs TTS — runs in main process to avoid renderer CORS restrictions
+async function elevenLabsTTS(text: string, apiKey: string, voiceId: string): Promise<Buffer | null> {
+  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+    method: 'POST',
+    headers: {
+      'xi-api-key':   apiKey,
+      'Content-Type': 'application/json',
+      'Accept':       'audio/mpeg',
+    },
+    body: JSON.stringify({
+      text,
+      model_id: 'eleven_turbo_v2_5',
+      // Tuned for clear, natural assistant voice:
+      // stability=0.55 — consistent tone, not monotone; similarity=0.80 — stays true to voice;
+      // style=0.25 — slight expressiveness; speaker_boost=true — cleaner audio
+      voice_settings: { stability: 0.55, similarity_boost: 0.80, style: 0.25, use_speaker_boost: true },
+    }),
+  })
+  if (!res.ok) throw new Error(`ElevenLabs ${res.status}: ${await res.text()}`)
+  return Buffer.from(await res.arrayBuffer())
+}
+
 export function registerVoiceHandlers(ipcMain: IpcMain): void {
   ipcMain.handle('ai:transcribeAudio', async (_event, audioData: Buffer, groqKey: string) => {
     if (!groqKey) return { success: false, error: 'No Groq API key. Add it in Settings → VOICE_INPUT.' }
     try {
       const transcript = await transcribeWithGroq(Buffer.from(audioData), groqKey)
       return { success: true, transcript }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('ai:ttsSpeak', async (_event, text: string, apiKey: string, voiceId: string) => {
+    try {
+      const audio = await elevenLabsTTS(text, apiKey, voiceId)
+      return { success: true, audio: audio?.toString('base64') }
     } catch (err) {
       return { success: false, error: String(err) }
     }

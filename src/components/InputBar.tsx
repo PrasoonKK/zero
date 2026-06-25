@@ -214,35 +214,38 @@ export default function InputBar(): React.JSX.Element {
 
     try {
       const vad = await startVAD({
-        threshold:   38,
+        // threshold=28: typical quiet room is ~5-12, normal speech is 25-80
+        threshold:   28,
         silenceMs:   1800,
         minSpeechMs: 1200,
         onVolume: v => setVadVolume(v),
         onSpeechStart: () => {
-          if (isSpeaking()) { ttsStop(); return }  // stop TTS so it doesn't record itself
+          if (isSpeaking()) { ttsStop() }   // stop speaking so we don't record TTS audio
           if (sendingRef.current) return
           setRecording(true)
           setInterimText('LISTENING...')
           vadChunks.current = []
-          const rec = new MediaRecorder(new MediaStream(), { mimeType })
-          // We need a fresh stream from the VAD's stream — reuse by creating own recorder
-          navigator.mediaDevices.getUserMedia({ audio: true }).then(s => {
-            const r = new MediaRecorder(s, { mimeType })
+          // Reuse the VAD's existing stream — avoids a second getUserMedia
+          const vad = vadRef.current
+          if (!vad) return
+          try {
+            const r = new MediaRecorder(vad.stream, { mimeType })
             vadRecRef.current = r
             r.ondataavailable = e => { if (e.data.size > 0) vadChunks.current.push(e.data) }
-            r.start(250)
-          }).catch(() => {})
-          void rec
+            r.start(100)   // 100ms slices for smoother chunks
+          } catch (e) {
+            console.error('VAD recorder failed:', e)
+            setRecording(false)
+          }
         },
         onSpeechEnd: async () => {
           setRecording(false)
           const rec = vadRecRef.current
-          if (!rec) { setInterimText(''); return }
+          if (!rec || rec.state === 'inactive') { setInterimText(''); return }
 
-          await new Promise<void>(res => {
-            rec.onstop = () => res()
-            rec.stop()
-            rec.stream?.getTracks().forEach(t => t.stop())
+          await new Promise<void>(done => {
+            rec.onstop = () => done()
+            if (rec.state !== 'inactive') rec.stop()
           })
           vadRecRef.current = null
 
@@ -255,7 +258,6 @@ export default function InputBar(): React.JSX.Element {
           setInterimText('')
 
           if (res.success && res.transcript?.trim() && !isNoiseTranscript(res.transcript)) {
-            // Auto-send directly without user pressing anything
             const transcript = res.transcript.trim()
             try { await sendText(transcript) }
             finally { setLoading(false); sendingRef.current = false; abortRef.current = null }

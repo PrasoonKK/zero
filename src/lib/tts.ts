@@ -1,35 +1,38 @@
-// TTS with two providers:
-// 1. ElevenLabs (if key set) — high quality, cross-platform, free 10k chars/month
-// 2. Web Speech API fallback — OS voices, no key, works offline
-//
-// Both share a sentence queue so audio never overlaps.
+// TTS engine — sentence queue, two providers:
+//   ElevenLabs (via IPC to avoid CORS) when key is set
+//   Web Speech API fallback (OS voices, no key)
 
-let _elevenLabsKey  = ''
-let _elevenLabsVoice = '21m00Tcm4TlvDq8ikWAM'  // Rachel — clear, neutral
-let _rate = 1.05
+let _elevenLabsKey   = ''
+// Adam: deep, calm, authoritative — closest to Jarvis
+// Alternative voices (paste into SettingsPanel later):
+//   Rachel:   21m00Tcm4TlvDq8ikWAM  (warm female)
+//   Clyde:    2EiwWnXFnvU5JabPnv8n  (older male, rich)
+//   Freya:    jsCqWAovK2LkecY7zXl4  (agentic assistant female)
+let _elevenLabsVoice = 'pNInz6obpgDQGcFmaJgB'   // Adam
+let _rate            = 1.0
 
-// ── Config (called from App.tsx when settings load) ──────────────────────────
 export function configureTTS(opts: { elevenLabsKey?: string; voiceId?: string; rate?: number }) {
   if (opts.elevenLabsKey  !== undefined) _elevenLabsKey   = opts.elevenLabsKey
   if (opts.voiceId        !== undefined) _elevenLabsVoice = opts.voiceId
   if (opts.rate           !== undefined) _rate            = opts.rate
 }
 
-// ── Queue ────────────────────────────────────────────────────────────────────
-type QueueItem = { text: string; resolve: () => void }
-const _queue: QueueItem[] = []
-let _busy = false
+// ── Queue — JS-managed, not Web Speech API's internal queue ──────────────────
+// Each speak() call adds to this queue. drainQueue() processes one at a time.
+type Item = { text: string; resolve: () => void }
+const _q: Item[] = []
+let _busy    = false
 let _stopped = false
 let _currentAudio: HTMLAudioElement | null = null
 
-function drainQueue() {
-  if (_busy || _stopped || _queue.length === 0) return
+function drain() {
+  if (_busy || _stopped || _q.length === 0) return
   _busy = true
-  const { text, resolve } = _queue.shift()!
-  const clean = stripMarkdown(text)
-  if (!clean) { _busy = false; resolve(); drainQueue(); return }
+  const { text, resolve } = _q.shift()!
+  const clean = stripMarkdown(text).trim()
 
-  const done = () => { _busy = false; resolve(); drainQueue() }
+  const done = () => { _busy = false; resolve(); drain() }
+  if (!clean) { done(); return }
 
   if (_elevenLabsKey) {
     speakElevenLabs(clean).then(done).catch(done)
@@ -38,109 +41,131 @@ function drainQueue() {
   }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
-/** Queue a text segment for speaking. Returns when this segment finishes playing. */
 export function speak(text: string): Promise<void> {
   if (_stopped) return Promise.resolve()
-  return new Promise(resolve => { _queue.push({ text, resolve }); drainQueue() })
+  return new Promise(resolve => { _q.push({ text, resolve }); drain() })
 }
 
-/** Immediately stop all speech and clear queue. */
 export function stop(): void {
   _stopped = true
-  _queue.length = 0
+  _q.length = 0
+  _busy = false
+  if (_currentAudio) { _currentAudio.pause(); _currentAudio.src = ''; _currentAudio = null }
   window.speechSynthesis.cancel()
-  if (_currentAudio) { _currentAudio.pause(); _currentAudio = null }
-  // Re-enable for future calls
-  setTimeout(() => { _stopped = false }, 50)
+  setTimeout(() => { _stopped = false }, 80)
 }
 
 export function isSpeaking(): boolean {
-  return _busy || window.speechSynthesis.speaking
+  return _busy || !!_currentAudio || window.speechSynthesis.speaking
 }
 
-// ── ElevenLabs provider ───────────────────────────────────────────────────────
+// ── ElevenLabs — via IPC (main process does the fetch, no CORS) ───────────────
 async function speakElevenLabs(text: string): Promise<void> {
-  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${_elevenLabsVoice}`, {
-    method: 'POST',
-    headers: { 'xi-api-key': _elevenLabsKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-    body: JSON.stringify({
-      text,
-      model_id: 'eleven_turbo_v2_5',   // fastest model, ~300ms latency
-      voice_settings: { stability: 0.45, similarity_boost: 0.75, style: 0.1, use_speaker_boost: true },
-    }),
-  })
-  if (!res.ok) {
-    // ElevenLabs error — fall back to OS
+  const res = await window.ai.ttsSpeak(text, _elevenLabsKey, _elevenLabsVoice)
+
+  if (!res.success || !res.audio) {
+    // ElevenLabs failed — fall back to OS
     return speakOS(text)
   }
-  const blob = new Blob([await res.arrayBuffer()], { type: 'audio/mpeg' })
-  const url  = URL.createObjectURL(blob)
-  return new Promise((resolve) => {
+
+  // Decode base64 → Blob → play
+  const bytes  = atob(res.audio)
+  const buf    = new Uint8Array(bytes.length)
+  for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i)
+  const blob   = new Blob([buf], { type: 'audio/mpeg' })
+  const url    = URL.createObjectURL(blob)
+
+  return new Promise(resolve => {
     const audio = new Audio(url)
     _currentAudio = audio
-    audio.onended = () => { URL.revokeObjectURL(url); _currentAudio = null; resolve() }
-    audio.onerror = () => { URL.revokeObjectURL(url); _currentAudio = null; resolve() }
-    audio.play().catch(() => resolve())
+    const cleanup = () => {
+      URL.revokeObjectURL(url)
+      _currentAudio = null
+      resolve()
+    }
+    audio.onended = cleanup
+    audio.onerror = cleanup
+    audio.play().catch(cleanup)
   })
 }
 
-// ── Web Speech API provider ───────────────────────────────────────────────────
+// ── Web Speech API — OS voices, no key, handles Chromium bugs ─────────────────
+let _voicesCache: SpeechSynthesisVoice[] | null = null
+
+async function getVoices(): Promise<SpeechSynthesisVoice[]> {
+  if (_voicesCache) return _voicesCache
+  const immediate = window.speechSynthesis.getVoices()
+  if (immediate.length) { _voicesCache = immediate; return immediate }
+  return new Promise(resolve => {
+    const handler = () => {
+      const v = window.speechSynthesis.getVoices()
+      _voicesCache = v
+      resolve(v)
+    }
+    window.speechSynthesis.addEventListener('voiceschanged', handler, { once: true })
+    setTimeout(() => { handler() }, 1500)   // fallback if event never fires
+  })
+}
+
 async function speakOS(text: string): Promise<void> {
-  // Ensure voices are loaded (Chromium defers this)
   const voices = await getVoices()
 
   return new Promise(resolve => {
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.rate   = _rate
-    utterance.pitch  = 1.0
-    utterance.volume = 1
+    const utterance    = new SpeechSynthesisUtterance(text)
+    utterance.rate     = _rate
+    utterance.pitch    = 1.0
+    utterance.volume   = 1.0
 
-    // Prefer neural/high-quality voices across platforms
-    const preferred = voices.find(v =>
-      v.name.includes('Aria')   ||  // Windows 11 neural
-      v.name.includes('Jenny')  ||
-      v.name.includes('Guy')    ||
-      v.name.includes('Samantha') || // macOS
-      v.name.includes('Karen')  ||   // macOS
-      v.name.includes('Daniel') ||   // macOS/iOS
-      v.name.includes('Zira')   ||   // Windows 8+
-      v.name.includes('David')
-    ) || voices.find(v => v.lang.startsWith('en')) || null
+    // Prefer neural/online voices — they sound significantly better than legacy SAPI
+    // Order: best-sounding first. Windows 11 "Natural" voices are miles ahead of Zira/David.
+    const VOICE_PRIORITY = [
+      'Microsoft Guy Online (Natural)',
+      'Microsoft Aria Online (Natural)',
+      'Microsoft Jenny Online (Natural)',
+      'Microsoft Guy',
+      'Microsoft Aria',
+      'Microsoft Jenny',
+      'Samantha',   // macOS neural
+      'Karen',      // macOS
+      'Daniel',     // macOS UK
+      'Alex',       // macOS
+    ]
+    const preferred =
+      VOICE_PRIORITY.map(name => voices.find(v => v.name === name)).find(Boolean) ||
+      voices.find(v => v.name.includes('Natural') && v.lang.startsWith('en')) ||
+      voices.find(v => v.lang === 'en-US') ||
+      voices.find(v => v.lang.startsWith('en')) ||
+      null
     if (preferred) utterance.voice = preferred
 
-    // Chromium bug: speechSynthesis silently pauses after ~15s.
-    // Keep-alive: resume every 500ms if paused.
+    let resolved = false
+    const finish = () => {
+      if (resolved) return
+      resolved = true
+      clearInterval(keepAlive)
+      resolve()
+    }
+    utterance.onend   = finish
+    utterance.onerror = finish
+
+    // Chromium Electron bug: speechSynthesis silently pauses. Resume every 250ms.
     const keepAlive = setInterval(() => {
       if (window.speechSynthesis.paused) window.speechSynthesis.resume()
-    }, 500)
+    }, 250)
 
-    const cleanup = () => { clearInterval(keepAlive); resolve() }
-    utterance.onend   = cleanup
-    utterance.onerror = cleanup
+    // Safety timeout — if onend never fires (another Chromium bug)
+    setTimeout(finish, Math.max(3000, text.length * 80))
 
-    window.speechSynthesis.cancel()  // clear any stuck state
+    // NOTE: do NOT call speechSynthesis.cancel() here — it would kill other queued items
     window.speechSynthesis.speak(utterance)
-
-    // Safety net: if onend never fires (another Chromium bug), resolve after timeout
-    setTimeout(cleanup, text.length * 90 + 3000)
   })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function getVoices(): Promise<SpeechSynthesisVoice[]> {
-  return new Promise(resolve => {
-    const v = window.speechSynthesis.getVoices()
-    if (v.length) { resolve(v); return }
-    window.speechSynthesis.addEventListener('voiceschanged', () => resolve(window.speechSynthesis.getVoices()), { once: true })
-    setTimeout(() => resolve([]), 1000)  // fallback if event never fires
-  })
-}
-
-function stripMarkdown(text: string): string {
-  return text
+function stripMarkdown(t: string): string {
+  return t
     .replace(/```[\s\S]*?```/g, 'code block.')
-    .replace(/`([^`]+)`/g, '$1')
+    .replace(/`[^`]+`/g, s => s.slice(1, -1))
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/\*([^*]+)\*/g, '$1')
     .replace(/#{1,6}\s+/g, '')
@@ -148,5 +173,4 @@ function stripMarkdown(text: string): string {
     .replace(/\n{2,}/g, '. ')
     .replace(/\n/g, ' ')
     .replace(/\s{2,}/g, ' ')
-    .trim()
 }
