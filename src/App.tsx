@@ -6,7 +6,7 @@ import SettingsPanel from './components/SettingsPanel'
 import AgentPanel from './components/AgentPanel'
 import HomePage from './components/HomePage'
 import { ollamaStatus } from './lib/ollama'
-import { speak } from './lib/tts'
+import { speak, configureTTS } from './lib/tts'
 
 type View = 'home' | 'chat'
 
@@ -31,6 +31,10 @@ export default function App(): React.JSX.Element {
   }, [settings.theme])
 
   useEffect(() => {
+    configureTTS({ elevenLabsKey: settings.elevenLabsKey || '' })
+  }, [settings.elevenLabsKey])
+
+  useEffect(() => {
     const c = settings.accentColor || '#7bd6d1'
     document.documentElement.style.setProperty('--accent', c)
     // Derive rgba variants from hex for glow/bg effects
@@ -51,6 +55,7 @@ export default function App(): React.JSX.Element {
       if (saved['groqKey'])         u.groqKey         = saved['groqKey']
       if (saved['voiceMode'])       u.voiceMode       = saved['voiceMode'] as 'off' | 'manual' | 'auto'
       if (saved['ttsEnabled'])      u.ttsEnabled      = saved['ttsEnabled'] === 'true'
+      if (saved['elevenLabsKey'])   u.elevenLabsKey   = saved['elevenLabsKey']
       if (Object.keys(u).length) setSettings(u)
     }).catch(() => {})
 

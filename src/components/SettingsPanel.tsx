@@ -63,6 +63,7 @@ export default function SettingsPanel(): React.JSX.Element {
       if (settings.openrouterKey)   toSave['openrouterKey']   = settings.openrouterKey
       if (settings.openrouterModel) toSave['openrouterModel'] = settings.openrouterModel
       if (settings.groqKey)         toSave['groqKey']         = settings.groqKey
+      if (settings.elevenLabsKey)   toSave['elevenLabsKey']   = settings.elevenLabsKey
       toSave['voiceMode']  = settings.voiceMode
       toSave['ttsEnabled'] = String(settings.ttsEnabled)
       await window.ai.saveSettings(toSave)
@@ -239,6 +240,26 @@ export default function SettingsPanel(): React.JSX.Element {
                 placeholder="gsk_..."
               />
             </Field>
+
+            <div className="mt-4">
+              <Field label="ELEVENLABS_KEY — OPTIONAL (better voice quality)">
+                <FocusInput
+                  type="password"
+                  value={settings.elevenLabsKey || ''}
+                  onChange={e => setSettings({ elevenLabsKey: e.target.value })}
+                  placeholder="sk_... — free at elevenlabs.io"
+                />
+              </Field>
+              {settings.elevenLabsKey ? (
+                <p className="font-mono text-[10px] mt-1.5" style={{ color: 'var(--accent)' }}>
+                  ✓ ElevenLabs active — high quality voice, cross-platform
+                </p>
+              ) : (
+                <p className="font-mono text-[10px] text-[#444748] mt-1.5">
+                  Without key: uses OS voices (Windows SAPI / macOS). Add key for much better quality.
+                </p>
+              )}
+            </div>
 
             <div className="mt-4 space-y-3">
               <div>

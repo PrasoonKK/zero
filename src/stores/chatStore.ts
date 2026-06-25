@@ -31,6 +31,7 @@ export interface Settings {
   groqKey?: string
   voiceMode: 'off' | 'manual' | 'auto'  // off=no voice, manual=button, auto=always-on VAD
   ttsEnabled: boolean
+  elevenLabsKey?: string
 }
 
 interface ChatStore {

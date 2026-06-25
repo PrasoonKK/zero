@@ -4,6 +4,7 @@ import VoiceIndicator from './VoiceIndicator'
 import { ollamaChatStream, openRouterChatStream, ChatMessage } from '../lib/ollama'
 import { speak, stop as ttsStop, isSpeaking } from '../lib/tts'
 import { startVAD, VADInstance } from '../lib/vad'
+import { SentenceBuffer } from '../lib/sentenceBuffer'
 
 const SYSTEM_PROMPTS: Record<string, string> = {
   assistant: 'You are Zero, a helpful desktop AI assistant. Answer clearly and concisely. Remember all previous messages in this conversation.',
@@ -114,35 +115,55 @@ export default function InputBar(): React.JSX.Element {
     abortRef.current = abort
     let accumulated = ''
 
-    const finishWithTTS = async (content: string) => {
-      if (isTTSOn && content && !abort.signal.aborted) await speak(content)
+    // Streaming TTS: speak each sentence as it arrives, don't wait for full response
+    const streamWithTTS = async (
+      streamFn: (onChunk: (c: string) => void) => Promise<void>
+    ): Promise<boolean> => {
+      const buf = isTTSOn ? new SentenceBuffer() : null
+      try {
+        await streamFn(chunk => {
+          accumulated += chunk
+          updateLastMessage(accumulated)
+          if (buf) {
+            const sentences = buf.push(chunk)
+            sentences.forEach(s => speak(s))  // fire-and-forget per sentence, queue handles order
+          }
+        })
+        // Speak any remaining partial sentence at end of stream
+        if (buf) {
+          const tail = buf.flush()
+          if (tail) speak(tail)
+        }
+        return true
+      } catch (err: unknown) {
+        if ((err as { name?: string }).name === 'AbortError') return true
+        return false
+      }
     }
 
     if (ollamaOnline) {
-      try {
-        setProvider('ollama')
-        await ollamaChatStream(model, chatMessages, chunk => { accumulated += chunk; updateLastMessage(accumulated) }, abort.signal)
+      setProvider('ollama')
+      const ok = await streamWithTTS(onChunk =>
+        ollamaChatStream(model, chatMessages, onChunk, abort.signal)
+      )
+      if (ok) {
         if (!accumulated) updateLastMessage(`> MODEL_NOT_FOUND\n\nPull the model:\n  ollama pull ${model}`)
-        else await finishWithTTS(accumulated)
         return
-      } catch (err: unknown) {
-        if ((err as { name?: string }).name === 'AbortError') return
-        accumulated = ''; updateLastMessage('')
       }
+      accumulated = ''; updateLastMessage('')
     }
 
     if (settings.openrouterKey) {
-      try {
-        setProvider('openrouter')
-        const orModel = settings.openrouterModel || 'mistralai/mistral-7b-instruct:free'
-        await openRouterChatStream(settings.openrouterKey, orModel, chatMessages, chunk => { accumulated += chunk; updateLastMessage(accumulated) }, abort.signal)
+      setProvider('openrouter')
+      const orModel = settings.openrouterModel || 'mistralai/mistral-7b-instruct:free'
+      const ok = await streamWithTTS(onChunk =>
+        openRouterChatStream(settings.openrouterKey!, orModel, chatMessages, onChunk, abort.signal)
+      )
+      if (ok) {
         if (!accumulated) updateLastMessage('> EMPTY_RESPONSE from OpenRouter')
-        else await finishWithTTS(accumulated)
         return
-      } catch (err: unknown) {
-        if ((err as { name?: string }).name === 'AbortError') return
-        updateLastMessage(`> OPENROUTER_ERROR\n\n${String(err)}`); return
       }
+      updateLastMessage(`> OPENROUTER_ERROR`); return
     }
 
     updateLastMessage('> NO_LLM_AVAILABLE\n\nOllama is offline and no OpenRouter key is set.\nStart Ollama:  ollama serve\nOr add an OpenRouter key in Settings.')
