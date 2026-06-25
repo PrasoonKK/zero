@@ -1,74 +1,72 @@
 // Voice Activity Detection — Web Audio API, no packages, no API keys.
-// Monitors mic RMS every 50ms. Fires onSpeechStart/onSpeechEnd when
-// real speech is detected (not background hiss or short noise bursts).
+// Caller passes in an external MediaStream (so InputBar owns the mic capture,
+// not the VAD). One getUserMedia total for both analysis and recording.
 
 export interface VADOptions {
+  stream:        MediaStream    // caller-owned mic stream
   onSpeechStart: () => void
   onSpeechEnd:   () => void
   onVolume?:     (vol: number) => void   // 0–100 for waveform UI
-  threshold?:    number    // RMS level 0-255 that counts as speech (default 35)
+  threshold?:    number    // RMS level 0-255 (default 28)
   silenceMs?:    number    // ms of quiet before speech ends (default 1800)
-  minSpeechMs?:  number    // ms of sustained speech before onSpeechEnd fires (default 1500)
+  minSpeechMs?:  number    // ms of sustained speech required (default 1000)
 }
 
 export interface VADInstance {
-  stop:   () => void
-  stream: MediaStream   // share with MediaRecorder — avoids a second getUserMedia
+  stop: () => void
 }
 
-// Noise transcriptions Groq whispers on silence — discard these.
+// Groq Whisper silence hallucinations — discard these transcripts.
 const NOISE_PATTERNS = [
-  /^\.+$/,                            // just dots
-  /^(you|yeah|yes|no|ok|okay|um+|uh+|hmm+)\.?$/i,
+  /^\.+$/,
+  /^(you|yeah|yes|no|ok|okay|um+|uh+|hmm+|huh)\.?$/i,
   /^thank you\.?$/i,
   /^thanks\.?$/i,
-  /^(bye|goodbye)\.?$/i,
+  /^(bye|goodbye|see you)\.?$/i,
   /^please subscribe\.?$/i,
   /^\s*$/,
 ]
 
-/** Returns true if a transcript is likely noise/hallucination, not real speech. */
 export function isNoiseTranscript(text: string): boolean {
   const t = text.trim()
-  if (t.length < 4) return true                   // too short
-  if (t.split(/\s+/).length < 2) return true      // single word only
+  if (t.length < 4) return true
+  if (t.split(/\s+/).length < 2) return true
   return NOISE_PATTERNS.some(p => p.test(t))
 }
 
-export async function startVAD(opts: VADOptions): Promise<VADInstance> {
+export function startVAD(opts: VADOptions): VADInstance {
   const {
+    stream,
     onSpeechStart, onSpeechEnd, onVolume,
-    threshold   = 28,    // 28 out of 255 avg — loud enough for real speech, above quiet-room hiss
+    threshold   = 28,
     silenceMs   = 1800,
-    minSpeechMs = 1200,
+    minSpeechMs = 1000,
   } = opts
 
-  const stream  = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-  const ctx     = new AudioContext()
-  const src     = ctx.createMediaStreamSource(stream)
-  const ana     = ctx.createAnalyser()
-  ana.fftSize   = 1024
+  const ctx = new AudioContext()
+  const src = ctx.createMediaStreamSource(stream)
+  const ana = ctx.createAnalyser()
+  ana.fftSize = 1024
   src.connect(ana)
 
-  const buf = new Float32Array(ana.frequencyBinCount)
+  const bytes = new Uint8Array(ana.frequencyBinCount)
 
   let speaking      = false
   let speechStartAt = 0
   let silenceStart  = 0
   let rafId: number
+  let stopped       = false
 
   function getRMS(): number {
-    ana.getByteFrequencyData(new Uint8Array(buf.buffer))
-    // Use byte data — sum of freq bins / count gives mean energy
+    ana.getByteFrequencyData(bytes)
     let sum = 0
-    const bytes = new Uint8Array(buf.buffer)
     for (let i = 0; i < bytes.length; i++) sum += bytes[i]
     return sum / bytes.length
   }
 
   function tick() {
+    if (stopped) return
     const vol = getRMS()
-    // Amplify for display (make waveform look alive)
     onVolume?.(Math.min(100, (vol / threshold) * 40))
 
     const now = Date.now()
@@ -81,20 +79,18 @@ export async function startVAD(opts: VADOptions): Promise<VADInstance> {
         onSpeechStart()
       }
     } else {
-      if (vol <= threshold * 0.7) {   // hysteresis: stop at 70% of start threshold
+      if (vol <= threshold * 0.7) {
         if (silenceStart === 0) silenceStart = now
         if (now - silenceStart >= silenceMs) {
           speaking = false
-          // Only fire if speech was long enough to be real (not a cough or knock)
           if (now - speechStartAt >= minSpeechMs) {
             onSpeechEnd()
           } else {
-            // Too short — reset silently
-            onSpeechEnd()  // still fire so recorder stops, but isNoiseTranscript will filter it
+            onSpeechEnd()   // still fire — isNoiseTranscript will filter short clips
           }
         }
       } else {
-        silenceStart = 0   // reset silence timer on any sound
+        silenceStart = 0
       }
     }
 
@@ -104,11 +100,11 @@ export async function startVAD(opts: VADOptions): Promise<VADInstance> {
   rafId = requestAnimationFrame(tick)
 
   return {
-    stream,
     stop() {
+      stopped = true
       cancelAnimationFrame(rafId)
-      stream.getTracks().forEach(t => t.stop())
       ctx.close().catch(() => {})
+      // NOTE: caller owns the stream — we don't stop tracks here
     },
   }
 }

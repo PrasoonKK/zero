@@ -2,7 +2,7 @@ import React, { useState, useRef, KeyboardEvent, useCallback, useEffect } from '
 import { useChatStore } from '../stores/chatStore'
 import VoiceIndicator from './VoiceIndicator'
 import { ollamaChatStream, openRouterChatStream, ChatMessage } from '../lib/ollama'
-import { speak, stop as ttsStop, isSpeaking } from '../lib/tts'
+import { speak, stop as ttsStop } from '../lib/tts'
 import { startVAD, VADInstance, isNoiseTranscript } from '../lib/vad'
 import { WordBuffer } from '../lib/sentenceBuffer'
 
@@ -13,27 +13,37 @@ const SYSTEM_PROMPTS: Record<string, string> = {
 
 const LLM_CTX = '__LLM_CONTEXT__:'
 
+const MIME = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+  ? 'audio/webm;codecs=opus'
+  : 'audio/webm'
+
 export default function InputBar(): React.JSX.Element {
   const [input, setInput]             = useState('')
   const [interimText, setInterimText] = useState('')
-  const [vadVolume, setVadVolume]     = useState(0)    // 0-100 for live waveform
+  const [vadVolume, setVadVolume]     = useState(0)
 
   const {
     isLoading, isRecording, messages, addMessage, updateLastMessage,
     setLoading, setRecording, mode, settings, setProvider, ollamaOnline,
   } = useChatStore()
 
-  const textareaRef     = useRef<HTMLTextAreaElement>(null)
-  const sendingRef      = useRef(false)
-  const abortRef        = useRef<AbortController | null>(null)
-  const mediaRecRef     = useRef<MediaRecorder | null>(null)
-  const audioChunks     = useRef<Blob[]>([])
-  const vadRef          = useRef<VADInstance | null>(null)
-  const vadRecRef       = useRef<MediaRecorder | null>(null)
-  const vadChunks       = useRef<Blob[]>([])
-  const autoListenRef   = useRef(false)  // whether VAD loop is active
-  const isAutoMode      = settings.voiceMode === 'auto'
-  const isTTSOn         = settings.ttsEnabled
+  const textareaRef   = useRef<HTMLTextAreaElement>(null)
+  const sendingRef    = useRef(false)
+  const abortRef      = useRef<AbortController | null>(null)
+
+  // Manual PTT refs
+  const manualRecRef  = useRef<MediaRecorder | null>(null)
+  const manualChunks  = useRef<Blob[]>([])
+
+  // Auto-listen refs — InputBar owns the mic stream lifecycle
+  const micStreamRef  = useRef<MediaStream | null>(null)
+  const vadRef        = useRef<VADInstance | null>(null)
+  const vadRecRef     = useRef<MediaRecorder | null>(null)
+  const vadChunks     = useRef<Blob[]>([])
+  const autoActiveRef = useRef(false)
+
+  const isAutoMode = settings.voiceMode === 'auto'
+  const isTTSOn    = settings.ttsEnabled
 
   // ─── Build message history ────────────────────────────────────────────────
   const buildMessages = useCallback((userText: string): ChatMessage[] => {
@@ -48,7 +58,7 @@ export default function InputBar(): React.JSX.Element {
     ]
   }, [messages, mode])
 
-  // ─── Core send ───────────────────────────────────────────────────────────
+  // ─── Core send ────────────────────────────────────────────────────────────
   const sendText = useCallback(async (text: string) => {
     if (!text.trim() || isLoading || sendingRef.current) return
     sendingRef.current = true
@@ -56,15 +66,15 @@ export default function InputBar(): React.JSX.Element {
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
     addMessage({ role: 'user', content: text })
-    ttsStop()  // stop any ongoing speech before responding
+    ttsStop()
 
-    // ── System commands — call ONCE, reuse result in LLM block ──
-    let cachedSysResult: string | null = null
+    // ── System commands — call once ──
+    let sysResult: string | null = null
     try {
-      cachedSysResult = await window.ai.systemCommand(text)
-      if (cachedSysResult !== null && !cachedSysResult.startsWith(LLM_CTX)) {
-        addMessage({ role: 'assistant', content: cachedSysResult })
-        if (isTTSOn) await speak(cachedSysResult)
+      sysResult = await window.ai.systemCommand(text)
+      if (sysResult !== null && !sysResult.startsWith(LLM_CTX)) {
+        addMessage({ role: 'assistant', content: sysResult })
+        if (isTTSOn) void speak(sysResult)
         sendingRef.current = false
         return
       }
@@ -72,18 +82,18 @@ export default function InputBar(): React.JSX.Element {
 
     // ── Plugin triggers ──
     try {
-      const pluginList = await window.ai.listPlugins()
-      const lower = text.toLowerCase()
-      const matched = pluginList.find(p => p.triggers.some(t => lower.includes(t.toLowerCase())))
-      if (matched) {
+      const plugins = await window.ai.listPlugins()
+      const lower   = text.toLowerCase()
+      const hit     = plugins.find(p => p.triggers.some(t => lower.includes(t.toLowerCase())))
+      if (hit) {
         setLoading(true)
         addMessage({ role: 'assistant', content: '', isStreaming: true })
         try {
-          const pluginResult = await window.ai.runPlugin(matched.name, text)
-          updateLastMessage(pluginResult)
-          if (isTTSOn) await speak(pluginResult)
-        } catch (err) {
-          updateLastMessage(`⚠️ Plugin error: ${String(err)}`)
+          const res = await window.ai.runPlugin(hit.name, text)
+          updateLastMessage(res)
+          if (isTTSOn) void speak(res)
+        } catch (e) {
+          updateLastMessage(`⚠️ Plugin error: ${String(e)}`)
         } finally {
           setLoading(false); sendingRef.current = false
         }
@@ -91,53 +101,43 @@ export default function InputBar(): React.JSX.Element {
       }
     } catch { /* fall through */ }
 
-    // ── LLM call ──
+    // ── LLM ──
     setLoading(true)
     addMessage({ role: 'assistant', content: '', isStreaming: true })
 
-    // If system command returned __LLM_CONTEXT__, use that as the prompt (use cached result)
+    // __LLM_CONTEXT__ prefix = inject diff/context as direct LLM prompt
     let llmInput = text
-    if (cachedSysResult?.startsWith(LLM_CTX)) {
-      llmInput = cachedSysResult.slice(LLM_CTX.length)
-    }
+    if (sysResult?.startsWith(LLM_CTX)) llmInput = sysResult.slice(LLM_CTX.length)
 
-    const model        = mode === 'coder' ? (settings.coderModel || 'codellama') : (settings.chatModel || 'mistral')
-    const chatMessages = llmInput !== text
+    const model    = mode === 'coder' ? (settings.coderModel || 'codellama') : (settings.chatModel || 'mistral')
+    const msgs     = llmInput !== text
       ? [{ role: 'system' as const, content: 'You are Zero, a helpful AI assistant. Be concise.' }, { role: 'user' as const, content: llmInput }]
       : buildMessages(text)
-    const abort = new AbortController()
+    const abort    = new AbortController()
     abortRef.current = abort
     let accumulated = ''
 
-    // Streaming TTS: speak every N words as they arrive.
-    // ElevenLabs batch=12 (fewer calls), OS voices batch=5 (near-instant).
-    const streamWithTTS = async (
-      streamFn: (onChunk: (c: string) => void) => Promise<void>
-    ): Promise<boolean> => {
-      const batchSize = isTTSOn ? (settings.elevenLabsKey ? 12 : 5) : 0
+    // ElevenLabs: batch=6 words (prefetch pipeline closes the gap between chunks)
+    // OS voices:  batch=4 words (instant local TTS)
+    const streamWithTTS = async (fn: (cb: (c: string) => void) => Promise<void>): Promise<boolean> => {
+      const batchSize = isTTSOn ? (settings.elevenLabsKey ? 6 : 4) : 0
       const buf = batchSize > 0 ? new WordBuffer(batchSize) : null
       try {
-        await streamFn(chunk => {
+        await fn(chunk => {
           accumulated += chunk
           updateLastMessage(accumulated)
           if (buf) buf.push(chunk).forEach(batch => { void speak(batch) })
         })
-        if (buf) {
-          const tail = buf.flush()
-          if (tail.trim()) void speak(tail)
-        }
+        if (buf) { const tail = buf.flush(); if (tail.trim()) void speak(tail) }
         return true
-      } catch (err: unknown) {
-        if ((err as { name?: string }).name === 'AbortError') return true
-        return false
+      } catch (e: unknown) {
+        return (e as { name?: string }).name === 'AbortError'
       }
     }
 
     if (ollamaOnline) {
       setProvider('ollama')
-      const ok = await streamWithTTS(onChunk =>
-        ollamaChatStream(model, chatMessages, onChunk, abort.signal)
-      )
+      const ok = await streamWithTTS(cb => ollamaChatStream(model, msgs, cb, abort.signal))
       if (ok) {
         if (!accumulated) updateLastMessage(`> MODEL_NOT_FOUND\n\nPull the model:\n  ollama pull ${model}`)
         return
@@ -148,14 +148,12 @@ export default function InputBar(): React.JSX.Element {
     if (settings.openrouterKey) {
       setProvider('openrouter')
       const orModel = settings.openrouterModel || 'mistralai/mistral-7b-instruct:free'
-      const ok = await streamWithTTS(onChunk =>
-        openRouterChatStream(settings.openrouterKey!, orModel, chatMessages, onChunk, abort.signal)
-      )
+      const ok = await streamWithTTS(cb => openRouterChatStream(settings.openrouterKey!, orModel, msgs, cb, abort.signal))
       if (ok) {
         if (!accumulated) updateLastMessage('> EMPTY_RESPONSE from OpenRouter')
         return
       }
-      updateLastMessage(`> OPENROUTER_ERROR`); return
+      updateLastMessage('> OPENROUTER_ERROR'); return
     }
 
     updateLastMessage('> NO_LLM_AVAILABLE\n\nOllama is offline and no OpenRouter key is set.\nStart Ollama:  ollama serve\nOr add an OpenRouter key in Settings.')
@@ -168,70 +166,92 @@ export default function InputBar(): React.JSX.Element {
     finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
   }, [input, sendText, setLoading])
 
-  // ─── Manual voice (button) ────────────────────────────────────────────────
+  // ─── Manual push-to-talk ── directly sends, never puts text in box ────────
   const handleVoice = useCallback(async () => {
-    if (isRecording) { mediaRecRef.current?.stop(); return }
+    // Stop if already recording
+    if (isRecording) { manualRecRef.current?.stop(); return }
+
     if (!settings.groqKey) {
       addMessage({ role: 'system', content: '⚠ Voice requires a Groq API key. Add it in Settings → VOICE_INPUT.' })
       return
     }
+
     let stream: MediaStream
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }) }
     catch { addMessage({ role: 'system', content: '⚠ Microphone access denied.' }); return }
 
-    audioChunks.current = []
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm'
-    const rec = new MediaRecorder(stream, { mimeType })
-    mediaRecRef.current = rec
-    rec.ondataavailable = e => { if (e.data.size > 0) audioChunks.current.push(e.data) }
+    manualChunks.current = []
+    const rec = new MediaRecorder(stream, { mimeType: MIME })
+    manualRecRef.current = rec
+
+    rec.ondataavailable = e => { if (e.data.size > 0) manualChunks.current.push(e.data) }
     rec.onstop = async () => {
       stream.getTracks().forEach(t => t.stop())
       setRecording(false)
       setInterimText('TRANSCRIBING...')
-      const blob = new Blob(audioChunks.current, { type: mimeType })
+
+      const blob = new Blob(manualChunks.current, { type: MIME })
       const buf  = await blob.arrayBuffer()
       const res  = await window.ai.transcribeAudio(buf, settings.groqKey!)
       setInterimText('')
-      if (res.success && res.transcript) setInput(prev => (prev ? `${prev} ${res.transcript}` : res.transcript!).trim())
-      else addMessage({ role: 'system', content: `⚠ Transcription failed: ${res.error}` })
+
+      if (res.success && res.transcript?.trim()) {
+        // Auto-send — no text box involvement
+        try { await sendText(res.transcript.trim()) }
+        finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
+      } else if (!res.success) {
+        addMessage({ role: 'system', content: `⚠ Transcription failed: ${res.error}` })
+      }
     }
+
     rec.start(250)
     setRecording(true)
-  }, [isRecording, settings.groqKey, setRecording, addMessage])
+  }, [isRecording, settings.groqKey, setRecording, addMessage, sendText, setLoading])
 
   // ─── Auto-listen VAD loop ─────────────────────────────────────────────────
+  // InputBar creates ONE mic stream and shares it between:
+  //   • VAD AnalyserNode (for energy detection)
+  //   • MediaRecorder (for capturing speech audio)
   const startAutoListen = useCallback(async () => {
-    if (!settings.groqKey || autoListenRef.current) return
-    autoListenRef.current = true
+    if (!settings.groqKey || autoActiveRef.current) return
+    autoActiveRef.current = true
 
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm'
+    let micStream: MediaStream
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+    } catch {
+      autoActiveRef.current = false
+      return
+    }
+    micStreamRef.current = micStream
 
     try {
-      const vad = await startVAD({
-        // threshold=28: typical quiet room is ~5-12, normal speech is 25-80
+      const vad = startVAD({
+        stream:      micStream,
         threshold:   28,
         silenceMs:   1800,
-        minSpeechMs: 1200,
-        onVolume: v => setVadVolume(v),
+        minSpeechMs: 1000,
+        onVolume:    v => setVadVolume(v),
+
         onSpeechStart: () => {
-          ttsStop()   // always stop TTS first — don't record our own voice
-          if (sendingRef.current) return   // bot still processing last message — skip
+          ttsStop()   // kill TTS so we don't record our own voice
+          if (sendingRef.current) return   // still generating — skip this utterance
+
           setRecording(true)
           setInterimText('LISTENING...')
           vadChunks.current = []
-          // Reuse the VAD's existing stream — avoids a second getUserMedia
-          const vad = vadRef.current
-          if (!vad) return
+
           try {
-            const r = new MediaRecorder(vad.stream, { mimeType })
+            const r = new MediaRecorder(micStream, { mimeType: MIME })
             vadRecRef.current = r
             r.ondataavailable = e => { if (e.data.size > 0) vadChunks.current.push(e.data) }
-            r.start(100)   // 100ms slices for smoother chunks
+            r.start(100)
           } catch (e) {
-            console.error('VAD recorder failed:', e)
-            setRecording(false)
+            console.error('[VAD] recorder failed:', e)
+            setRecording(false); setInterimText('')
           }
         },
+
         onSpeechEnd: async () => {
           setRecording(false)
           const rec = vadRecRef.current
@@ -239,53 +259,53 @@ export default function InputBar(): React.JSX.Element {
 
           await new Promise<void>(done => {
             rec.onstop = () => done()
-            if (rec.state !== 'inactive') rec.stop()
+            try { rec.stop() } catch { done() }
           })
           vadRecRef.current = null
 
           if (vadChunks.current.length === 0) { setInterimText(''); return }
 
           setInterimText('TRANSCRIBING...')
-          const blob = new Blob(vadChunks.current, { type: mimeType })
+          const blob = new Blob(vadChunks.current, { type: MIME })
           const buf  = await blob.arrayBuffer()
           const res  = await window.ai.transcribeAudio(buf, settings.groqKey!)
           setInterimText('')
 
           if (res.success && res.transcript?.trim() && !isNoiseTranscript(res.transcript)) {
-            const transcript = res.transcript.trim()
-            try { await sendText(transcript) }
+            try { await sendText(res.transcript.trim()) }
             finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
           }
         },
       })
+
       vadRef.current = vad
     } catch {
-      autoListenRef.current = false
+      micStream.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
+      autoActiveRef.current = false
     }
   }, [settings.groqKey, sendText, setRecording, setLoading])
 
   const stopAutoListen = useCallback(() => {
     vadRef.current?.stop()
     vadRef.current = null
-    autoListenRef.current = false
+    // Stop the mic stream — release hardware
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+    autoActiveRef.current = false
     setVadVolume(0)
     setRecording(false)
     setInterimText('')
   }, [setRecording])
 
-  // Start/stop auto-listen when voiceMode changes
   useEffect(() => {
-    if (isAutoMode && settings.groqKey) {
-      startAutoListen()
-    } else {
-      stopAutoListen()
-    }
+    if (isAutoMode && settings.groqKey) startAutoListen()
+    else stopAutoListen()
     return () => stopAutoListen()
   }, [isAutoMode, settings.groqKey]) // eslint-disable-line
 
-  // Cleanup on unmount
   useEffect(() => () => {
-    mediaRecRef.current?.stop()
+    manualRecRef.current?.stop()
     stopAutoListen()
   }, []) // eslint-disable-line
 
@@ -302,18 +322,17 @@ export default function InputBar(): React.JSX.Element {
       className="relative px-5 py-3 shrink-0"
       style={{ borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-inputbar)', backdropFilter: 'blur(8px)' }}
     >
-      {/* Voice indicator — shown for both manual recording and auto-VAD listening */}
       {isRecording && (
         <div className="absolute bottom-full left-0 right-0 pb-1 px-0">
           <VoiceIndicator
-            onStop={isAutoMode ? stopAutoListen : () => mediaRecRef.current?.stop()}
+            onStop={isAutoMode ? stopAutoListen : () => manualRecRef.current?.stop()}
             volume={vadVolume}
           />
         </div>
       )}
 
       {interimText && (
-        <div className="mb-1.5 px-1 font-mono text-xs truncate label-caps" style={{ fontSize: 9, color: 'var(--accent)' }}>
+        <div className="mb-1.5 px-1 font-mono label-caps" style={{ fontSize: 9, color: 'var(--accent)' }}>
           {interimText}<span className="cursor-blink">_</span>
         </div>
       )}
@@ -334,16 +353,14 @@ export default function InputBar(): React.JSX.Element {
           style={{ minHeight: '38px', maxHeight: '120px', color: 'var(--text-primary)', caretColor: 'var(--accent)' }}
         />
 
-        {/* Auto-listen indicator / manual mic button */}
         {settings.voiceMode !== 'off' && (
           <button
             onClick={isAutoMode ? (isRecording ? stopAutoListen : startAutoListen) : handleVoice}
             className="flex-shrink-0 w-8 h-8 flex items-center justify-center transition-all active:scale-95"
             style={{ color: isRecording ? '#ffb4ab' : isAutoMode ? 'var(--accent)' : 'var(--text-muted)' }}
-            title={isAutoMode ? (isRecording ? 'Stop listening' : 'Listening (auto-on)') : 'Voice input'}
+            title={isAutoMode ? (isRecording ? 'Stop listening' : 'Listening (auto)') : 'Voice input (auto-sends)'}
           >
             {isAutoMode && !isRecording ? (
-              // Animated rings = always listening
               <div style={{ position: 'relative', width: 14, height: 14 }}>
                 <div style={{
                   position: 'absolute', inset: -3, borderRadius: '50%',
@@ -364,7 +381,6 @@ export default function InputBar(): React.JSX.Element {
           </button>
         )}
 
-        {/* Send / Stop */}
         <button
           onClick={isLoading ? handleStop : wrappedSend}
           disabled={!isLoading && (!input.trim() || sendingRef.current)}
