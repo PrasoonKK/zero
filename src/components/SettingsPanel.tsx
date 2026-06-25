@@ -63,6 +63,8 @@ export default function SettingsPanel(): React.JSX.Element {
       if (settings.openrouterKey)   toSave['openrouterKey']   = settings.openrouterKey
       if (settings.openrouterModel) toSave['openrouterModel'] = settings.openrouterModel
       if (settings.groqKey)         toSave['groqKey']         = settings.groqKey
+      toSave['voiceMode']  = settings.voiceMode
+      toSave['ttsEnabled'] = String(settings.ttsEnabled)
       await window.ai.saveSettings(toSave)
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
@@ -237,6 +239,45 @@ export default function SettingsPanel(): React.JSX.Element {
                 placeholder="gsk_..."
               />
             </Field>
+
+            <div className="mt-4 space-y-3">
+              <div>
+                <div className="label-caps text-[9px] text-[#8e9192] mb-2">LISTEN_MODE</div>
+                <div className="flex gap-2">
+                  {(['off', 'manual', 'auto'] as const).map(m => (
+                    <button
+                      key={m}
+                      onClick={() => setSettings({ voiceMode: m })}
+                      className="label-caps text-[9px] px-3 py-1.5 transition-all active:scale-95"
+                      style={{
+                        borderRadius: '2px',
+                        background: settings.voiceMode === m ? 'rgba(var(--accent-rgb),0.15)' : 'transparent',
+                        border: `1px solid ${settings.voiceMode === m ? 'rgba(var(--accent-rgb),0.4)' : 'rgba(68,71,72,0.4)'}`,
+                        color: settings.voiceMode === m ? 'var(--accent)' : '#8e9192',
+                      }}
+                    >
+                      {m === 'off' ? 'OFF' : m === 'manual' ? 'MANUAL (button)' : 'AUTO (always-on)'}
+                    </button>
+                  ))}
+                </div>
+                {settings.voiceMode === 'auto' && (
+                  <p className="font-mono text-[10px] text-[#8e9192] mt-2">
+                    Zero listens continuously — speaks when you do, sends automatically. Requires Groq key.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="font-mono text-sm" style={{ color: 'var(--text-body)' }}>Speak responses (TTS)</p>
+                  <p className="label-caps text-[9px] text-[#444748] mt-0.5">ZERO_SPEAKS_REPLIES</p>
+                </div>
+                <Toggle
+                  on={settings.ttsEnabled}
+                  onClick={() => setSettings({ ttsEnabled: !settings.ttsEnabled })}
+                />
+              </div>
+            </div>
           </section>
 
           {/* Hotkey */}

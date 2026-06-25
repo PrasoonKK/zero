@@ -29,6 +29,8 @@ export interface Settings {
   openrouterKey?: string
   openrouterModel?: string
   groqKey?: string
+  voiceMode: 'off' | 'manual' | 'auto'  // off=no voice, manual=button, auto=always-on VAD
+  ttsEnabled: boolean
 }
 
 interface ChatStore {
@@ -67,6 +69,8 @@ const defaultSettings: Settings = {
   theme: 'dark',
   accentColor: '#7bd6d1',
   openrouterModel: 'mistralai/mistral-7b-instruct:free',
+  voiceMode: 'manual',
+  ttsEnabled: true,
 }
 
 export const useChatStore = create<ChatStore>((set) => ({

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useChatStore } from './stores/chatStore'
 import ChatWindow from './components/ChatWindow'
 import InputBar from './components/InputBar'
@@ -6,12 +6,14 @@ import SettingsPanel from './components/SettingsPanel'
 import AgentPanel from './components/AgentPanel'
 import HomePage from './components/HomePage'
 import { ollamaStatus } from './lib/ollama'
+import { speak } from './lib/tts'
 
 type View = 'home' | 'chat'
 
 export default function App(): React.JSX.Element {
   const [view, setView]           = useState<View>('home')
   const [updateReady, setUpdateReady] = useState(false)
+  const greetedRef = useRef(false)
 
   const {
     settingsOpen, toggleSettings, setSettings, setOllamaOnline,
@@ -47,10 +49,22 @@ export default function App(): React.JSX.Element {
       if (saved['openrouterKey'])   u.openrouterKey   = saved['openrouterKey']
       if (saved['openrouterModel']) u.openrouterModel = saved['openrouterModel']
       if (saved['groqKey'])         u.groqKey         = saved['groqKey']
+      if (saved['voiceMode'])       u.voiceMode       = saved['voiceMode'] as 'off' | 'manual' | 'auto'
+      if (saved['ttsEnabled'])      u.ttsEnabled      = saved['ttsEnabled'] === 'true'
       if (Object.keys(u).length) setSettings(u)
     }).catch(() => {})
 
-    const check = () => ollamaStatus().then(setOllamaOnline).catch(() => setOllamaOnline(false))
+    const check = async () => {
+      const online = await ollamaStatus().catch(() => false)
+      setOllamaOnline(online)
+      // Greet once on first successful connection — only if TTS is enabled
+      if (online && !greetedRef.current && settings.ttsEnabled) {
+        greetedRef.current = true
+        const hour = new Date().getHours()
+        const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'
+        setTimeout(() => speak(`${greeting}. Zero is online and ready.`), 800)
+      }
+    }
     check()
     const id = setInterval(check, 15000)
 
