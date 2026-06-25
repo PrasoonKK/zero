@@ -3,8 +3,8 @@ import { useChatStore } from '../stores/chatStore'
 import VoiceIndicator from './VoiceIndicator'
 import { ollamaChatStream, openRouterChatStream, ChatMessage } from '../lib/ollama'
 import { speak, stop as ttsStop, isSpeaking } from '../lib/tts'
-import { startVAD, VADInstance } from '../lib/vad'
-import { SentenceBuffer } from '../lib/sentenceBuffer'
+import { startVAD, VADInstance, isNoiseTranscript } from '../lib/vad'
+import { WordBuffer } from '../lib/sentenceBuffer'
 
 const SYSTEM_PROMPTS: Record<string, string> = {
   assistant: 'You are Zero, a helpful desktop AI assistant. Answer clearly and concisely. Remember all previous messages in this conversation.',
@@ -115,24 +115,22 @@ export default function InputBar(): React.JSX.Element {
     abortRef.current = abort
     let accumulated = ''
 
-    // Streaming TTS: speak each sentence as it arrives, don't wait for full response
+    // Streaming TTS: speak every N words as they arrive.
+    // ElevenLabs batch=12 (fewer calls), OS voices batch=5 (near-instant).
     const streamWithTTS = async (
       streamFn: (onChunk: (c: string) => void) => Promise<void>
     ): Promise<boolean> => {
-      const buf = isTTSOn ? new SentenceBuffer() : null
+      const batchSize = isTTSOn ? (settings.elevenLabsKey ? 12 : 5) : 0
+      const buf = batchSize > 0 ? new WordBuffer(batchSize) : null
       try {
         await streamFn(chunk => {
           accumulated += chunk
           updateLastMessage(accumulated)
-          if (buf) {
-            const sentences = buf.push(chunk)
-            sentences.forEach(s => speak(s))  // fire-and-forget per sentence, queue handles order
-          }
+          if (buf) buf.push(chunk).forEach(batch => { void speak(batch) })
         })
-        // Speak any remaining partial sentence at end of stream
         if (buf) {
           const tail = buf.flush()
-          if (tail) speak(tail)
+          if (tail.trim()) void speak(tail)
         }
         return true
       } catch (err: unknown) {
@@ -216,9 +214,9 @@ export default function InputBar(): React.JSX.Element {
 
     try {
       const vad = await startVAD({
-        threshold:   20,
-        silenceMs:   1200,
-        minSpeechMs: 300,
+        threshold:   38,
+        silenceMs:   1800,
+        minSpeechMs: 1200,
         onVolume: v => setVadVolume(v),
         onSpeechStart: () => {
           if (isSpeaking()) { ttsStop(); return }  // stop TTS so it doesn't record itself
@@ -256,7 +254,7 @@ export default function InputBar(): React.JSX.Element {
           const res  = await window.ai.transcribeAudio(buf, settings.groqKey!)
           setInterimText('')
 
-          if (res.success && res.transcript?.trim()) {
+          if (res.success && res.transcript?.trim() && !isNoiseTranscript(res.transcript)) {
             // Auto-send directly without user pressing anything
             const transcript = res.transcript.trim()
             try { await sendText(transcript) }
