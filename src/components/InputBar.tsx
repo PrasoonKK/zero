@@ -3,7 +3,7 @@ import { useChatStore } from '../stores/chatStore'
 import VoiceIndicator from './VoiceIndicator'
 import { ollamaChatStream, openRouterChatStream, ChatMessage } from '../lib/ollama'
 import { speak, stop as ttsStop } from '../lib/tts'
-import { startVAD, VADInstance, isNoiseTranscript } from '../lib/vad'
+import { isNoiseTranscript } from '../lib/vad'
 import { WordBuffer } from '../lib/sentenceBuffer'
 
 const SYSTEM_PROMPTS: Record<string, string> = {
@@ -13,34 +13,30 @@ const SYSTEM_PROMPTS: Record<string, string> = {
 
 const LLM_CTX = '__LLM_CONTEXT__:'
 
-const MIME = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-  ? 'audio/webm;codecs=opus'
-  : 'audio/webm'
+// Prefer webkitSpeechRecognition (Chromium built-in) over native SpeechRecognition
+const SR: typeof SpeechRecognition | null =
+  (typeof window !== 'undefined' && (window.SpeechRecognition || (window as unknown as { webkitSpeechRecognition: typeof SpeechRecognition }).webkitSpeechRecognition)) || null
 
 export default function InputBar(): React.JSX.Element {
   const [input, setInput]             = useState('')
   const [interimText, setInterimText] = useState('')
-  const [vadVolume, setVadVolume]     = useState(0)
+  const [isListening, setIsListening] = useState(false)
 
   const {
     isLoading, isRecording, messages, addMessage, updateLastMessage,
     setLoading, setRecording, mode, settings, setProvider, ollamaOnline,
   } = useChatStore()
 
-  const textareaRef   = useRef<HTMLTextAreaElement>(null)
-  const sendingRef    = useRef(false)
-  const abortRef      = useRef<AbortController | null>(null)
+  const textareaRef    = useRef<HTMLTextAreaElement>(null)
+  const sendingRef     = useRef(false)
+  const abortRef       = useRef<AbortController | null>(null)
+  const srRef          = useRef<SpeechRecognition | null>(null)   // auto-listen
+  const autoActiveRef  = useRef(false)
 
-  // Manual PTT refs
-  const manualRecRef  = useRef<MediaRecorder | null>(null)
-  const manualChunks  = useRef<Blob[]>([])
-
-  // Auto-listen refs — InputBar owns the mic stream lifecycle
-  const micStreamRef  = useRef<MediaStream | null>(null)
-  const vadRef        = useRef<VADInstance | null>(null)
-  const vadRecRef     = useRef<MediaRecorder | null>(null)
-  const vadChunks     = useRef<Blob[]>([])
-  const autoActiveRef = useRef(false)
+  // Manual PTT (Groq fallback — only if webkitSR unavailable)
+  const MIME           = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm'
+  const manualRecRef   = useRef<MediaRecorder | null>(null)
+  const manualChunks   = useRef<Blob[]>([])
 
   const isAutoMode = settings.voiceMode === 'auto'
   const isTTSOn    = settings.ttsEnabled
@@ -71,14 +67,14 @@ export default function InputBar(): React.JSX.Element {
     // Load memories for context injection
     let memoryContext = ''
     try {
-      const memories: Array<{id: string; text: string; createdAt: number}> = await window.ai.memoryGet()
+      const memories: Array<{ id: string; text: string; createdAt: number }> = await window.ai.memoryGet()
       if (memories.length > 0) {
         memoryContext = '\n\nThings the user has asked you to remember:\n' +
           memories.slice(-20).map(m => `• ${m.text}`).join('\n')
       }
     } catch { /* ignore */ }
 
-    // ── System commands — call once ──
+    // ── System commands ──
     let sysResult: string | null = null
     try {
       sysResult = await window.ai.systemCommand(text)
@@ -113,9 +109,7 @@ export default function InputBar(): React.JSX.Element {
           if (isTTSOn) void speak(res)
         } catch (e) {
           updateLastMessage(`⚠️ Plugin error: ${String(e)}`)
-        } finally {
-          setLoading(false); sendingRef.current = false
-        }
+        } finally { setLoading(false); sendingRef.current = false }
         return
       }
     } catch { /* fall through */ }
@@ -124,22 +118,19 @@ export default function InputBar(): React.JSX.Element {
     setLoading(true)
     addMessage({ role: 'assistant', content: '', isStreaming: true })
 
-    // __LLM_CONTEXT__ prefix = inject diff/context as direct LLM prompt
     let llmInput = text
     if (sysResult?.startsWith(LLM_CTX)) llmInput = sysResult.slice(LLM_CTX.length)
 
-    const model    = mode === 'coder' ? (settings.coderModel || 'codellama') : (settings.chatModel || 'mistral')
-    const msgs     = llmInput !== text
+    const model = mode === 'coder' ? (settings.coderModel || 'codellama') : (settings.chatModel || 'mistral')
+    const msgs  = llmInput !== text
       ? [{ role: 'system' as const, content: 'You are Zero, a helpful AI assistant. Be concise.' }, { role: 'user' as const, content: llmInput }]
       : buildMessages(text, memoryContext)
-    const abort    = new AbortController()
+    const abort = new AbortController()
     abortRef.current = abort
     let accumulated = ''
 
-    // ElevenLabs: batch=6 words (prefetch pipeline closes the gap between chunks)
-    // OS voices:  batch=4 words (instant local TTS)
     const streamWithTTS = async (fn: (cb: (c: string) => void) => Promise<void>): Promise<boolean> => {
-      const batchSize = isTTSOn ? (settings.elevenLabsKey ? 6 : 4) : 0
+      const batchSize = isTTSOn ? 6 : 0
       const buf = batchSize > 0 ? new WordBuffer(batchSize) : null
       try {
         await fn(chunk => {
@@ -185,13 +176,97 @@ export default function InputBar(): React.JSX.Element {
     finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
   }, [input, sendText, setLoading])
 
-  // ─── Manual push-to-talk ── directly sends, never puts text in box ────────
+  // ─── Auto-listen: webkitSpeechRecognition ────────────────────────────────
+  // Chromium handles VAD, silence detection, and all audio internally.
+  // Continuous mode — restarts itself on `onend` to stay alive.
+  const startAutoListen = useCallback(() => {
+    if (!SR || autoActiveRef.current) return
+    autoActiveRef.current = true
+
+    const rec = new SR()
+    rec.continuous     = true
+    rec.interimResults = true
+    rec.lang           = 'en-US'
+    rec.maxAlternatives = 1
+
+    rec.onstart = () => { setIsListening(true) }
+
+    rec.onresult = (event: SpeechRecognitionEvent) => {
+      const result = event.results[event.results.length - 1]
+      if (!result) return
+
+      if (!result.isFinal) {
+        // Show interim as hint
+        setInterimText(result[0].transcript)
+        return
+      }
+
+      setInterimText('')
+      const transcript = result[0].transcript.trim()
+      if (!transcript || isNoiseTranscript(transcript)) return
+
+      ttsStop()   // stop speaking before we send
+      if (sendingRef.current) return  // skip if still processing
+
+      void (async () => {
+        try { await sendText(transcript) }
+        finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
+      })()
+    }
+
+    rec.onerror = (e: SpeechRecognitionErrorEvent) => {
+      // 'no-speech' and 'audio-capture' are expected — don't stop the loop
+      if (e.error === 'not-allowed') {
+        autoActiveRef.current = false
+        setIsListening(false)
+        addMessage({ role: 'system', content: '⚠ Microphone access denied for speech recognition.' })
+      }
+    }
+
+    rec.onend = () => {
+      // Auto-restart — keeps listening until explicitly stopped
+      if (autoActiveRef.current) {
+        try { rec.start() } catch { /* ignore if already started */ }
+      } else {
+        setIsListening(false)
+        setInterimText('')
+      }
+    }
+
+    try {
+      rec.start()
+      srRef.current = rec
+      setRecording(true)
+    } catch (e) {
+      autoActiveRef.current = false
+      console.error('[SR] start failed:', e)
+    }
+  }, [sendText, addMessage, setRecording, setLoading])
+
+  const stopAutoListen = useCallback(() => {
+    autoActiveRef.current = false
+    try { srRef.current?.stop() } catch {}
+    srRef.current = null
+    setIsListening(false)
+    setInterimText('')
+    setRecording(false)
+  }, [setRecording])
+
+  useEffect(() => {
+    if (isAutoMode) startAutoListen()
+    else stopAutoListen()
+    return () => stopAutoListen()
+  }, [isAutoMode]) // eslint-disable-line
+
+  useEffect(() => () => { stopAutoListen(); manualRecRef.current?.stop() }, []) // eslint-disable-line
+
+  // ─── Manual PTT — Groq transcription, directly sends ────────────────────
+  // Used when voiceMode=manual OR when SR unavailable and voiceMode=auto
   const handleVoice = useCallback(async () => {
-    // Stop if already recording
     if (isRecording) { manualRecRef.current?.stop(); return }
 
     if (!settings.groqKey) {
-      addMessage({ role: 'system', content: '⚠ Voice requires a Groq API key. Add it in Settings → VOICE_INPUT.' })
+      addMessage({ role: 'system', content: '⚠ Manual voice requires a Groq API key in Settings → VOICE_INPUT. For auto-listen, enable it in Settings — it uses built-in speech recognition (no key needed).' })
       return
     }
 
@@ -208,14 +283,11 @@ export default function InputBar(): React.JSX.Element {
       stream.getTracks().forEach(t => t.stop())
       setRecording(false)
       setInterimText('TRANSCRIBING...')
-
       const blob = new Blob(manualChunks.current, { type: MIME })
       const buf  = await blob.arrayBuffer()
       const res  = await window.ai.transcribeAudio(buf, settings.groqKey!)
       setInterimText('')
-
       if (res.success && res.transcript?.trim()) {
-        // Auto-send — no text box involvement
         try { await sendText(res.transcript.trim()) }
         finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
       } else if (!res.success) {
@@ -225,108 +297,7 @@ export default function InputBar(): React.JSX.Element {
 
     rec.start(250)
     setRecording(true)
-  }, [isRecording, settings.groqKey, setRecording, addMessage, sendText, setLoading])
-
-  // ─── Auto-listen VAD loop ─────────────────────────────────────────────────
-  // InputBar creates ONE mic stream and shares it between:
-  //   • VAD AnalyserNode (for energy detection)
-  //   • MediaRecorder (for capturing speech audio)
-  const startAutoListen = useCallback(async () => {
-    if (!settings.groqKey || autoActiveRef.current) return
-    autoActiveRef.current = true
-
-    let micStream: MediaStream
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-    } catch {
-      autoActiveRef.current = false
-      return
-    }
-    micStreamRef.current = micStream
-
-    try {
-      const vad = startVAD({
-        stream:      micStream,
-        threshold:   28,
-        silenceMs:   1800,
-        minSpeechMs: 1000,
-        onVolume:    v => setVadVolume(v),
-
-        onSpeechStart: () => {
-          ttsStop()   // kill TTS so we don't record our own voice
-          if (sendingRef.current) return   // still generating — skip this utterance
-
-          setRecording(true)
-          setInterimText('LISTENING...')
-          vadChunks.current = []
-
-          try {
-            const r = new MediaRecorder(micStream, { mimeType: MIME })
-            vadRecRef.current = r
-            r.ondataavailable = e => { if (e.data.size > 0) vadChunks.current.push(e.data) }
-            r.start(100)
-          } catch (e) {
-            console.error('[VAD] recorder failed:', e)
-            setRecording(false); setInterimText('')
-          }
-        },
-
-        onSpeechEnd: async () => {
-          setRecording(false)
-          const rec = vadRecRef.current
-          if (!rec || rec.state === 'inactive') { setInterimText(''); return }
-
-          await new Promise<void>(done => {
-            rec.onstop = () => done()
-            try { rec.stop() } catch { done() }
-          })
-          vadRecRef.current = null
-
-          if (vadChunks.current.length === 0) { setInterimText(''); return }
-
-          setInterimText('TRANSCRIBING...')
-          const blob = new Blob(vadChunks.current, { type: MIME })
-          const buf  = await blob.arrayBuffer()
-          const res  = await window.ai.transcribeAudio(buf, settings.groqKey!)
-          setInterimText('')
-
-          if (res.success && res.transcript?.trim() && !isNoiseTranscript(res.transcript)) {
-            try { await sendText(res.transcript.trim()) }
-            finally { setLoading(false); sendingRef.current = false; abortRef.current = null }
-          }
-        },
-      })
-
-      vadRef.current = vad
-    } catch {
-      micStream.getTracks().forEach(t => t.stop())
-      micStreamRef.current = null
-      autoActiveRef.current = false
-    }
-  }, [settings.groqKey, sendText, setRecording, setLoading])
-
-  const stopAutoListen = useCallback(() => {
-    vadRef.current?.stop()
-    vadRef.current = null
-    // Stop the mic stream — release hardware
-    micStreamRef.current?.getTracks().forEach(t => t.stop())
-    micStreamRef.current = null
-    autoActiveRef.current = false
-    setVadVolume(0)
-    setRecording(false)
-    setInterimText('')
-  }, [setRecording])
-
-  useEffect(() => {
-    if (isAutoMode && settings.groqKey) startAutoListen()
-    else stopAutoListen()
-    return () => stopAutoListen()
-  }, [isAutoMode, settings.groqKey]) // eslint-disable-line
-
-  useEffect(() => () => {
-    manualRecRef.current?.stop()
-    stopAutoListen()
-  }, []) // eslint-disable-line
+  }, [isRecording, settings.groqKey, setRecording, addMessage, sendText, setLoading, MIME])
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); wrappedSend() }
@@ -336,22 +307,24 @@ export default function InputBar(): React.JSX.Element {
     if (el) { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 120)}px` }
   }
 
+  const micActive = isAutoMode ? isListening : isRecording
+
   return (
     <div
       className="relative px-5 py-3 shrink-0"
       style={{ borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-inputbar)', backdropFilter: 'blur(8px)' }}
     >
-      {isRecording && (
-        <div className="absolute bottom-full left-0 right-0 pb-1 px-0">
+      {micActive && (
+        <div className="absolute bottom-full left-0 right-0 pb-1">
           <VoiceIndicator
             onStop={isAutoMode ? stopAutoListen : () => manualRecRef.current?.stop()}
-            volume={vadVolume}
+            volume={0}
           />
         </div>
       )}
 
       {interimText && (
-        <div className="mb-1.5 px-1 font-mono label-caps" style={{ fontSize: 9, color: 'var(--accent)' }}>
+        <div className="mb-1.5 px-1 font-mono label-caps" style={{ fontSize: 9, color: 'var(--accent)', opacity: 0.7 }}>
           {interimText}<span className="cursor-blink">_</span>
         </div>
       )}
@@ -365,8 +338,8 @@ export default function InputBar(): React.JSX.Element {
           onChange={e => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           onInput={handleInput}
-          placeholder={isAutoMode ? 'AUTO_LISTEN_ACTIVE — or type here...' : 'ENTER_COMMAND...'}
-          disabled={isLoading || isRecording}
+          placeholder={isAutoMode ? 'AUTO_LISTEN_ACTIVE — or type...' : 'ENTER_COMMAND...'}
+          disabled={isLoading}
           rows={1}
           className="flex-1 font-mono text-sm resize-none outline-none disabled:opacity-40 bg-transparent"
           style={{ minHeight: '38px', maxHeight: '120px', color: 'var(--text-primary)', caretColor: 'var(--accent)' }}
@@ -374,17 +347,17 @@ export default function InputBar(): React.JSX.Element {
 
         {settings.voiceMode !== 'off' && (
           <button
-            onClick={isAutoMode ? (isRecording ? stopAutoListen : startAutoListen) : handleVoice}
+            onClick={isAutoMode ? (isListening ? stopAutoListen : startAutoListen) : handleVoice}
             className="flex-shrink-0 w-8 h-8 flex items-center justify-center transition-all active:scale-95"
-            style={{ color: isRecording ? '#ffb4ab' : isAutoMode ? 'var(--accent)' : 'var(--text-muted)' }}
-            title={isAutoMode ? (isRecording ? 'Stop listening' : 'Listening (auto)') : 'Voice input (auto-sends)'}
+            style={{ color: micActive ? '#ffb4ab' : isAutoMode ? 'var(--accent)' : 'var(--text-muted)' }}
+            title={isAutoMode ? (isListening ? 'Stop listening' : 'Start listening') : 'Voice input (auto-sends)'}
           >
-            {isAutoMode && !isRecording ? (
+            {isAutoMode && isListening ? (
               <div style={{ position: 'relative', width: 14, height: 14 }}>
                 <div style={{
                   position: 'absolute', inset: -3, borderRadius: '50%',
-                  border: '1px solid rgba(var(--accent-rgb),0.4)',
-                  animation: 'ring-pulse 2s ease-in-out infinite',
+                  border: '1px solid rgba(var(--accent-rgb),0.5)',
+                  animation: 'ring-pulse 1.2s ease-in-out infinite',
                 }} />
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>

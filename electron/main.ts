@@ -8,6 +8,7 @@ import { registerAgentHandlers } from './ipc/agent'
 import { registerPluginHandlers, loadPlugins } from './ipc/plugins'
 import { registerGitHandlers } from './ipc/git'
 import { registerMemoryHandlers } from './ipc/memory'
+import { registerEdgeTTSHandlers } from './ipc/edgetts'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -63,6 +64,7 @@ app.whenReady().then(async () => {
   registerPluginHandlers(ipcMain)
   registerGitHandlers(ipcMain)
   registerMemoryHandlers(ipcMain)
+  registerEdgeTTSHandlers(ipcMain)
   await loadPlugins()
 })
 

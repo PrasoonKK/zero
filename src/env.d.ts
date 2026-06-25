@@ -40,5 +40,6 @@ interface Window {
     memoryGet:   () => Promise<Array<{ id: string; text: string; createdAt: number }>>
     memoryAdd:   (text: string) => Promise<{ success: boolean }>
     memoryClear: () => Promise<{ success: boolean }>
+    edgeTTS: (text: string, voice?: string) => Promise<{ success: boolean; audio?: string; error?: string }>
   }
 }

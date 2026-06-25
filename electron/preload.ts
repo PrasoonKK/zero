@@ -45,4 +45,6 @@ contextBridge.exposeInMainWorld('ai', {
   memoryGet:   (): Promise<Array<{ id: string; text: string; createdAt: number }>> => ipcRenderer.invoke('ai:memoryGet'),
   memoryAdd:   (text: string): Promise<{ success: boolean }> => ipcRenderer.invoke('ai:memoryAdd', text),
   memoryClear: (): Promise<{ success: boolean }> => ipcRenderer.invoke('ai:memoryClear'),
+  edgeTTS: (text: string, voice?: string): Promise<{ success: boolean; audio?: string; error?: string }> =>
+    ipcRenderer.invoke('ai:edgeTTS', text, voice),
 })

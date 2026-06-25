@@ -1,66 +1,83 @@
-// TTS engine — prefetch pipeline so chunks play back-to-back with no gap.
+// TTS engine — three providers, best available first:
+//   1. ElevenLabs  (API key required — best quality)
+//   2. Edge TTS    (free, no key — Microsoft neural voices, natural punctuation)
+//   3. Web Speech  (OS fallback — last resort)
 //
-// How it works:
-//   drain() picks up item N, immediately starts pre-fetching item N+1 in
-//   parallel. By the time N finishes playing, N+1 is already downloaded.
-//   Result: first chunk has ~250ms latency; all subsequent chunks are gapless.
-//
-// Providers:
-//   ElevenLabs (via IPC — CORS blocked in renderer) when key is set
-//   Web Speech API fallback (OS voices)
+// Prefetch pipeline: fetches chunk N+1 while chunk N is playing → gapless audio.
 
 let _elevenLabsKey   = ''
-// Adam: deep, calm, authoritative — Jarvis-like
-let _elevenLabsVoice = 'pNInz6obpgDQGcFmaJgB'
+let _elevenLabsVoice = 'pNInz6obpgDQGcFmaJgB'   // Adam (deep/calm)
+let _edgeVoice       = 'en-US-GuyNeural'          // Guy (authoritative, closest to Jarvis)
 let _rate            = 1.0
 
-export function configureTTS(opts: { elevenLabsKey?: string; voiceId?: string; rate?: number }) {
-  if (opts.elevenLabsKey  !== undefined) _elevenLabsKey   = opts.elevenLabsKey
-  if (opts.voiceId        !== undefined) _elevenLabsVoice = opts.voiceId
-  if (opts.rate           !== undefined) _rate            = opts.rate
+export function configureTTS(opts: {
+  elevenLabsKey?: string
+  elevenLabsVoice?: string
+  edgeVoice?: string
+  rate?: number
+}) {
+  if (opts.elevenLabsKey   !== undefined) _elevenLabsKey   = opts.elevenLabsKey
+  if (opts.elevenLabsVoice !== undefined) _elevenLabsVoice = opts.elevenLabsVoice
+  if (opts.edgeVoice       !== undefined) _edgeVoice       = opts.edgeVoice
+  if (opts.rate            !== undefined) _rate            = opts.rate
 }
 
 // ── Queue ─────────────────────────────────────────────────────────────────────
 type Item = {
   text:          string
   resolve:       () => void
-  audioPromise?: Promise<string | null>   // pre-fetched base64, set by previous drain()
+  audioPromise?: Promise<string | null>   // pre-fetched base64 audio
 }
 
-const _q:     Item[]               = []
-let _busy     = false
-let _stopped  = false
+const _q:    Item[]                    = []
+let _busy    = false
+let _stopped = false
 let _curAudio: HTMLAudioElement | null = null
 
-// Kick off an ElevenLabs fetch — returns a promise for the base64 audio string.
-// Runs from drain() so it starts while the previous item is still playing.
-function prefetchEL(text: string): Promise<string | null> {
+// ── Provider: which one to use ────────────────────────────────────────────────
+function useElevenLabs() { return !!_elevenLabsKey }
+function useEdgeTTS()    { return !_elevenLabsKey }   // Edge TTS when no EL key
+
+// ── Prefetch helpers ──────────────────────────────────────────────────────────
+function fetchElevenLabs(text: string): Promise<string | null> {
   return window.ai.ttsSpeak(text, _elevenLabsKey, _elevenLabsVoice)
-    .then(res => (res.success && res.audio) ? res.audio : null)
+    .then(r => r.success && r.audio ? r.audio : null)
     .catch(() => null)
 }
 
+function fetchEdgeTTS(text: string): Promise<string | null> {
+  return window.ai.edgeTTS(text, _edgeVoice)
+    .then(r => r.success && r.audio ? r.audio : null)
+    .catch(() => null)
+}
+
+function prefetch(text: string): Promise<string | null> {
+  const clean = stripMarkdown(text).trim()
+  if (!clean) return Promise.resolve(null)
+  return useElevenLabs() ? fetchElevenLabs(clean) : fetchEdgeTTS(clean)
+}
+
+// ── Core drain loop ───────────────────────────────────────────────────────────
 function drain() {
   if (_busy || _stopped || _q.length === 0) return
   _busy = true
-  const item = _q.shift()!
+  const item  = _q.shift()!
   const clean = stripMarkdown(item.text).trim()
 
   const done = () => { _busy = false; item.resolve(); drain() }
   if (!clean) { done(); return }
 
-  // Pre-fetch next item RIGHT NOW (parallel to current item loading/playing)
-  if (_elevenLabsKey && _q.length > 0 && !_q[0].audioPromise) {
+  // Start pre-fetching next item right now — runs in parallel with current playback
+  if (_q.length > 0 && !_q[0].audioPromise) {
     const nextClean = stripMarkdown(_q[0].text).trim()
-    if (nextClean) _q[0].audioPromise = prefetchEL(nextClean)
+    if (nextClean) _q[0].audioPromise = prefetch(nextClean)
   }
 
-  if (_elevenLabsKey) {
-    // Use pre-fetched audio if available, otherwise fetch now (first item)
-    const audioP = item.audioPromise ?? prefetchEL(clean)
+  if (useElevenLabs() || useEdgeTTS()) {
+    const audioP = item.audioPromise ?? prefetch(clean)
     audioP.then(b64 => {
       if (_stopped) { done(); return }
-      if (!b64) { speakOS(clean).then(done).catch(done); return }
+      if (!b64)     { speakOS(clean).then(done).catch(done); return }
       playBase64(b64).then(done).catch(done)
     }).catch(() => speakOS(clean).then(done).catch(done))
   } else {
@@ -70,10 +87,7 @@ function drain() {
 
 export function speak(text: string): Promise<void> {
   if (_stopped) return Promise.resolve()
-  return new Promise(resolve => {
-    _q.push({ text, resolve })
-    drain()
-  })
+  return new Promise(resolve => { _q.push({ text, resolve }); drain() })
 }
 
 export function stop(): void {
@@ -106,13 +120,13 @@ function playBase64(b64: string): Promise<void> {
   })
 }
 
-// ── Web Speech API — OS voices, handles Chromium pause bug ───────────────────
+// ── Web Speech API fallback ────────────────────────────────────────────────────
 let _voicesCache: SpeechSynthesisVoice[] | null = null
 
 async function getVoices(): Promise<SpeechSynthesisVoice[]> {
   if (_voicesCache) return _voicesCache
-  const immediate = window.speechSynthesis.getVoices()
-  if (immediate.length) { _voicesCache = immediate; return immediate }
+  const v = window.speechSynthesis.getVoices()
+  if (v.length) { _voicesCache = v; return v }
   return new Promise(resolve => {
     const handler = () => { _voicesCache = window.speechSynthesis.getVoices(); resolve(_voicesCache) }
     window.speechSynthesis.addEventListener('voiceschanged', handler, { once: true })
@@ -122,44 +136,25 @@ async function getVoices(): Promise<SpeechSynthesisVoice[]> {
 
 async function speakOS(text: string): Promise<void> {
   const voices = await getVoices()
-
   return new Promise(resolve => {
-    const u    = new SpeechSynthesisUtterance(text)
-    u.rate     = _rate
-    u.pitch    = 1.0
-    u.volume   = 1.0
+    const u = new SpeechSynthesisUtterance(text)
+    u.rate = _rate; u.pitch = 1.0; u.volume = 1.0
 
-    // Prefer Windows 11 neural voices — much better than legacy SAPI
     const PRIORITY = [
-      'Microsoft Guy Online (Natural)',
-      'Microsoft Aria Online (Natural)',
-      'Microsoft Jenny Online (Natural)',
-      'Microsoft Guy',
-      'Microsoft Aria',
-      'Microsoft Jenny',
-      'Samantha', 'Karen', 'Daniel', 'Alex',
+      'Microsoft Guy Online (Natural)', 'Microsoft Aria Online (Natural)',
+      'Microsoft Jenny Online (Natural)', 'Microsoft Guy', 'Microsoft Aria',
+      'Samantha', 'Karen', 'Daniel',
     ]
-    const voice =
-      PRIORITY.map(n => voices.find(v => v.name === n)).find(Boolean) ||
-      voices.find(v => v.name.includes('Natural') && v.lang.startsWith('en')) ||
-      voices.find(v => v.lang === 'en-US') ||
-      voices.find(v => v.lang.startsWith('en')) ||
-      null
+    const voice = PRIORITY.map(n => voices.find(v => v.name === n)).find(Boolean)
+      || voices.find(v => v.lang === 'en-US') || null
     if (voice) u.voice = voice
 
     let done = false
-    const finish = () => { if (done) return; done = true; clearInterval(keepAlive); resolve() }
-    u.onend   = finish
-    u.onerror = finish
-
-    // Chromium Electron bug: speechSynthesis silently pauses → resume every 250ms
-    const keepAlive = setInterval(() => {
-      if (window.speechSynthesis.paused) window.speechSynthesis.resume()
-    }, 250)
-
-    // Safety timeout — onend sometimes never fires in Electron
+    const finish = () => { if (done) return; done = true; clearInterval(kA); resolve() }
+    u.onend = finish; u.onerror = finish
+    // Chromium Electron: speechSynthesis silently pauses — keep-alive fix
+    const kA = setInterval(() => { if (window.speechSynthesis.paused) window.speechSynthesis.resume() }, 250)
     setTimeout(finish, Math.max(3000, text.length * 80))
-
     window.speechSynthesis.speak(u)
   })
 }
